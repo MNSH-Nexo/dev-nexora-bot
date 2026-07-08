@@ -1493,7 +1493,7 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
   # unattended-upgrades را موقتاً متوقف کن تا lock آزاد بشه
   systemctl stop unattended-upgrades 2>/dev/null || true
   # صبر برای آزاد شدن apt lock
-  local _w=0
+  _w=0
   while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || \
         fuser /var/lib/apt/lists/lock      &>/dev/null 2>&1; do
     sleep 2; (( _w+=2 ))
