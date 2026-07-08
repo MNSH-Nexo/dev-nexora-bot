@@ -1193,17 +1193,41 @@ JSEOF
     return 1
   fi
 
-  # ── verify better-sqlite3 ────────────────────────────────
-  # نسخه 12.x prebuilt binary دارد — نیازی به compile نیست.
-  # فقط یک تست سریع می‌کنیم تا مطمئن شویم لود می‌شود.
-  _info "→ Verifying better-sqlite3..."
-  if node -e "require('better-sqlite3')" 2>/dev/null; then
-    _ok "better-sqlite3 loaded OK (prebuilt binary)"
+  # ── build better-sqlite3 native binary ──────────────────────
+  # مشکل: npm install --ignore-scripts یعنی node-gyp اجرا نمی‌شود
+  # و better_sqlite3.node ساخته نمی‌شود. باید همیشه rebuild بزنیم.
+  _info "→ Building better-sqlite3 native binary..."
+
+  # تست با path کامل — نه global
+  local _sqlite_test_ok=false
+  if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
+    _sqlite_test_ok=true
+    _ok "better-sqlite3 binary already built ✓"
+  fi
+
+  if [[ "$_sqlite_test_ok" != "true" ]]; then
+    _info "Binary not found — running npm rebuild better-sqlite3..."
+    # نصب build tools اگه ندارند
+    if ! command -v node-gyp &>/dev/null; then
+      npm install -g node-gyp 2>/dev/null | tail -1 || true
+    fi
+    # rebuild با npm (که در cwd اجرا می‌شه)
+    if npm rebuild better-sqlite3 2>&1 | tail -5; then
+      _ok "better-sqlite3 native binary built ✓"
+    else
+      _warn "npm rebuild failed — trying node-gyp directly..."
+      (cd "${PANEL_INSTALL_DIR}/node_modules/better-sqlite3" && \
+        node-gyp rebuild 2>&1 | tail -5) || \
+        _warn "node-gyp also failed"
+    fi
+  fi
+
+  # تست نهایی با path کامل
+  if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
+    _ok "better-sqlite3 verified ✓"
   else
-    _warn "better-sqlite3 not prebuilt — trying native compile..."
-    npm rebuild better-sqlite3 2>&1 | tail -3 || \
-      "${_pnpm_bin}" rebuild better-sqlite3 2>&1 | tail -3 || \
-      _warn "better-sqlite3 rebuild failed — may fail at runtime"
+    _err "better-sqlite3 binary still missing after rebuild"
+    _err "Manual fix: cd /opt/nexora-panel && npm rebuild better-sqlite3"
   fi
 
   _ok "Dependencies ready"
