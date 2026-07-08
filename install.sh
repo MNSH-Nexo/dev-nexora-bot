@@ -1164,6 +1164,7 @@ JSEOF
   # روش ۲: npm با --legacy-peer-deps (fallback اگه pnpm crash کرد)
   # روش ۳: pnpm با --force + --concurrency=1 (آخرین تلاش)
   local _install_ok=false
+  local _used_npm=false   # flag: اگه npm fallback استفاده شد باید rebuild بزنیم
 
   _info "→ Trying pnpm install (concurrency=1 to prevent Worker crash)..."
   if NODE_OPTIONS="--max-old-space-size=512" \
@@ -1176,6 +1177,7 @@ JSEOF
     rm -f pnpm-lock.yaml 2>/dev/null || true
     if npm install --ignore-scripts --legacy-peer-deps 2>&1; then
       _install_ok=true
+      _used_npm=true
       _ok "npm install succeeded (fallback)"
     else
       _warn "npm also failed — trying pnpm --force + concurrency=1 as last resort..."
@@ -1193,41 +1195,37 @@ JSEOF
     return 1
   fi
 
-  # ── build better-sqlite3 native binary ──────────────────────
-  # مشکل: npm install --ignore-scripts یعنی node-gyp اجرا نمی‌شود
-  # و better_sqlite3.node ساخته نمی‌شود. باید همیشه rebuild بزنیم.
-  _info "→ Building better-sqlite3 native binary..."
+  # ── build better-sqlite3 native binary (فقط اگه npm fallback بود) ──
+  # pnpm با --ignore-scripts مشکل rebuild ندارد چون native پکیج‌ها را
+  # از prebuilt binary می‌گیرد. npm با --ignore-scripts postinstall را
+  # skip می‌کند و better_sqlite3.node ساخته نمی‌شود — پس باید rebuild بزنیم.
+  if [[ "$_used_npm" == "true" ]]; then
+    _info "→ npm was used — rebuilding better-sqlite3 native binary..."
 
-  # تست با path کامل — نه global
-  local _sqlite_test_ok=false
-  if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
-    _sqlite_test_ok=true
-    _ok "better-sqlite3 binary already built ✓"
-  fi
-
-  if [[ "$_sqlite_test_ok" != "true" ]]; then
-    _info "Binary not found — running npm rebuild better-sqlite3..."
-    # نصب build tools اگه ندارند
-    if ! command -v node-gyp &>/dev/null; then
-      npm install -g node-gyp 2>/dev/null | tail -1 || true
-    fi
-    # rebuild با npm (که در cwd اجرا می‌شه)
-    if npm rebuild better-sqlite3 2>&1 | tail -5; then
-      _ok "better-sqlite3 native binary built ✓"
+    # تست اول — شاید prebuilt binary دانلود شده باشد
+    if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
+      _ok "better-sqlite3 binary OK (prebuilt) ✓"
     else
-      _warn "npm rebuild failed — trying node-gyp directly..."
-      (cd "${PANEL_INSTALL_DIR}/node_modules/better-sqlite3" && \
-        node-gyp rebuild 2>&1 | tail -5) || \
-        _warn "node-gyp also failed"
-    fi
-  fi
+      # node-gyp نصب نیست؟
+      command -v node-gyp &>/dev/null || npm install -g node-gyp 2>/dev/null | tail -1 || true
+      if npm rebuild better-sqlite3 2>&1 | tail -5; then
+        _ok "better-sqlite3 native binary built ✓"
+      else
+        _warn "npm rebuild failed — trying node-gyp directly..."
+        (cd "${PANEL_INSTALL_DIR}/node_modules/better-sqlite3" && \
+          node-gyp rebuild 2>&1 | tail -5) || _warn "node-gyp also failed"
+      fi
 
-  # تست نهایی با path کامل
-  if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
-    _ok "better-sqlite3 verified ✓"
+      # تست نهایی
+      if node -e "require('${PANEL_INSTALL_DIR}/node_modules/better-sqlite3')" 2>/dev/null; then
+        _ok "better-sqlite3 verified ✓"
+      else
+        _err "better-sqlite3 binary still missing — DB will not work"
+        _err "Manual fix: cd ${PANEL_INSTALL_DIR} && npm rebuild better-sqlite3"
+      fi
+    fi
   else
-    _err "better-sqlite3 binary still missing after rebuild"
-    _err "Manual fix: cd /opt/nexora-panel && npm rebuild better-sqlite3"
+    _info "→ pnpm was used — skipping better-sqlite3 rebuild (not needed)"
   fi
 
   _ok "Dependencies ready"
@@ -1290,6 +1288,22 @@ SVCEOF
   else
     _warn "Service may have issues. Check: journalctl -u nexora-panel -n 30"
     journalctl -u nexora-panel -n 8 --no-pager 2>/dev/null || true
+  fi
+
+  # ── اگه npm استفاده شد، rebuild + restart بعد از start ───────
+  # دلیل: build قبل از rebuild انجام شد، پس .next binary references
+  # اشتباه دارد. یک restart کافیه چون rebuild قبلاً انجام شده.
+  if [[ "${_used_npm:-false}" == "true" ]]; then
+    _info "npm was used — running final rebuild + restart to ensure DB works..."
+    cd "$PANEL_INSTALL_DIR"
+    npm rebuild better-sqlite3 2>&1 | tail -2 || true
+    sleep 1
+    systemctl restart nexora-panel
+    sleep 3
+    if systemctl is-active nexora-panel &>/dev/null; then
+      _ok "Panel restarted after npm rebuild ✓"
+    fi
+    cd "$BOT_DIR" 2>/dev/null || true
   fi
 
   # ── post-start diagnostic ─────────────────────────────────

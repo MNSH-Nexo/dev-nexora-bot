@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  nexo-bot — Nexora VPN Bot Management CLI v2.0
+#  nexo-bot — Nexora VPN Bot Management CLI v2.1
 #  Usage: nexo-bot
 #  Built by MNSH-Nexo — https://github.com/MNSH-Nexo
 # ============================================================
@@ -47,7 +47,7 @@ _banner() {
   echo "  ██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║██╔══██╗██╔══██║"
   echo "  ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝██║  ██║██║  ██║"
   echo "  ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝"
-  echo -e "${RESET}${DIM}                 VPN Bot Management CLI v2.0${RESET}"
+  echo -e "${RESET}${DIM}                 VPN Bot Management CLI v2.1${RESET}"
   echo -e "${DIM}         Built by MNSH-Nexo · github.com/MNSH-Nexo${RESET}"
   echo ""
   echo -e "  ${DIM}┌─────────────────────────────────────────────────┐${RESET}"
@@ -1655,6 +1655,337 @@ _menu_uninstall() {
 }
 
 # ────────────────────────────────────────────────────────────────
+#  [U] Update Nexora
+# ────────────────────────────────────────────────────────────────
+
+REPO_STABLE="https://github.com/MNSH-Nexo/Nexora-Bot-Panel.git"
+REPO_BETA="https://github.com/MNSH-Nexo/Dev-Nexora-Bot.git"
+
+# نمایش نسخه فعلی از git log
+_update_show_version() {
+  echo ""
+  echo -e "  ${BOLD}Current version:${RESET}"
+  if [[ -d "$BOT_DIR/.git" ]]; then
+    local _commit _date _remote
+    _commit=$(git -C "$BOT_DIR" log --oneline -1 2>/dev/null || echo "unknown")
+    _date=$(git -C "$BOT_DIR" log -1 --format="%ci" 2>/dev/null | cut -d' ' -f1 || echo "")
+    _remote=$(git -C "$BOT_DIR" remote get-url origin 2>/dev/null || echo "unknown")
+    echo -e "  ${CYAN}Commit  :${RESET} $_commit"
+    [[ -n "$_date" ]] && echo -e "  ${CYAN}Date    :${RESET} $_date"
+    echo -e "  ${CYAN}Remote  :${RESET} $_remote"
+  else
+    _warn "No git history found in $BOT_DIR"
+  fi
+  echo ""
+}
+
+# انتخاب مخزن توسط کاربر
+_update_pick_repo() {
+  PICKED_REPO=""
+  PICKED_REPO_NAME=""
+  echo -e "  ${BOLD}Select update source:${RESET}"
+  echo ""
+  echo -e "  ${BOLD}[1]${RESET}  ${GREEN}Stable${RESET}  — Nexora-Bot-Panel  ${DIM}(recommended — production)${RESET}"
+  echo -e "       ${DIM}${REPO_STABLE}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}[2]${RESET}  ${YELLOW}Beta${RESET}    — Dev-Nexora-Bot    ${DIM}(latest features — may be unstable)${RESET}"
+  echo -e "       ${DIM}${REPO_BETA}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}[0]${RESET}  ${DIM}Cancel${RESET}"
+  echo ""
+  read -rp "  Choose: " _pick
+  case "$_pick" in
+    1) PICKED_REPO="$REPO_STABLE"; PICKED_REPO_NAME="Stable (Nexora-Bot-Panel)" ;;
+    2) PICKED_REPO="$REPO_BETA";   PICKED_REPO_NAME="Beta (Dev-Nexora-Bot)" ;;
+    0|"") return 1 ;;
+    *) _warn "Invalid option."; return 1 ;;
+  esac
+  return 0
+}
+
+# بک‌آپ سریع قبل از آپدیت
+_update_pre_backup() {
+  local _ts; _ts=$(date +%Y%m%d_%H%M%S)
+  echo ""
+  echo -e "  ${BOLD}━━━ Pre-update backup ━━━${RESET}"
+  echo ""
+
+  # ۱. بک‌آپ bot/.env
+  if [[ -f "$ENV_FILE" ]]; then
+    local _dst="/root/nexora_pre_update_env_${_ts}.env"
+    cp "$ENV_FILE" "$_dst" && chmod 600 "$_dst" && _ok "bot/.env  →  $_dst"
+  else
+    _warn "bot/.env not found — skipping."
+  fi
+
+  # ۲. بک‌آپ panel/.env.local
+  if [[ -f "$PANEL_ENV_LOCAL" ]]; then
+    local _dst2="/root/nexora_pre_update_panel_env_${_ts}.env"
+    cp "$PANEL_ENV_LOCAL" "$_dst2" && chmod 600 "$_dst2" && _ok "panel/.env.local  →  $_dst2"
+  fi
+
+  # ۳. بک‌آپ دیتابیس
+  if _use_postgres; then
+    if [[ -f "$COMPOSE_FILE" ]]; then
+      local _dump="/root/nexora_pre_update_pgdump_${_ts}.sql"
+      _info "Backing up PostgreSQL..."
+      _dc exec -T db pg_dump -U botuser vpn_bot > "$_dump" 2>/dev/null \
+        && _ok "PostgreSQL dump  →  $_dump" \
+        || _warn "pg_dump skipped (DB may be stopped)."
+    fi
+  else
+    local _db; _db=$(_find_sqlite_db)
+    if [[ -n "$_db" ]]; then
+      local _db_dst="/root/nexora_pre_update_sqlite_${_ts}.db"
+      if command -v sqlite3 &>/dev/null; then
+        sqlite3 "$_db" ".backup '${_db_dst}'" 2>/dev/null \
+          && _ok "SQLite backup  →  $_db_dst" \
+          || { cp "$_db" "$_db_dst" && _ok "SQLite (cp)  →  $_db_dst"; }
+      else
+        cp "$_db" "$_db_dst" && _ok "SQLite (cp)  →  $_db_dst"
+      fi
+    else
+      _warn "SQLite DB not found (bot may not have started yet)."
+    fi
+  fi
+  echo ""
+}
+
+# آپدیت فایل‌های ربات از git (بدون لمس .env)
+_update_bot_files() {
+  local _repo="$1"
+  echo ""
+  echo -e "  ${BOLD}━━━ Updating bot files ━━━${RESET}"
+  echo ""
+  _ensure_git() {
+    command -v git &>/dev/null && return 0
+    _info "git not found — installing..."
+    if command -v apt-get &>/dev/null; then
+      apt-get install -y -qq git 2>/dev/null
+    elif command -v dnf &>/dev/null; then
+      dnf install -y git 2>/dev/null
+    else
+      yum install -y git 2>/dev/null
+    fi
+    command -v git &>/dev/null || { _err "git install failed."; return 1; }
+  }
+  _ensure_git || return 1
+
+  # بررسی اتصال
+  _info "Checking connection to GitHub..."
+  if ! curl -sfI "https://github.com" --max-time 10 -o /dev/null 2>/dev/null; then
+    _err "Cannot reach GitHub. Check network/DNS."
+    return 1
+  fi
+  _ok "GitHub reachable."
+
+  if [[ -d "$BOT_DIR/.git" ]]; then
+    # مخزن فعلی رو بررسی کن — اگه عوض شده، remote رو آپدیت کن
+    local _current_remote; _current_remote=$(git -C "$BOT_DIR" remote get-url origin 2>/dev/null || echo "")
+    local _repo_lower; _repo_lower=$(echo "$_repo" | tr '[:upper:]' '[:lower:]')
+    local _cur_lower;  _cur_lower=$(echo "$_current_remote" | tr '[:upper:]' '[:lower:]')
+    if [[ "$_cur_lower" != "$_repo_lower" ]]; then
+      _info "Switching remote from:  $_current_remote"
+      _info "                    to:  $_repo"
+      git -C "$BOT_DIR" remote set-url origin "$_repo" 2>/dev/null || true
+    fi
+    _info "Fetching latest code..."
+    git -C "$BOT_DIR" fetch origin 2>&1 | tail -2 || { _err "git fetch failed."; return 1; }
+    _info "Applying updates (code files only — .env untouched)..."
+    git -C "$BOT_DIR" reset --hard origin/main 2>&1 | tail -2 || { _err "git reset failed."; return 1; }
+    git -C "$BOT_DIR" clean -fd --exclude='.env' --exclude='*.db' 2>/dev/null || true
+  else
+    # اگه .git نداره — clone کن در پوشه موقت و فایل‌ها رو کپی کن
+    _info "No .git found — cloning into temp dir and syncing..."
+    local _tmp; _tmp=$(mktemp -d)
+    git clone --depth 1 "$_repo" "$_tmp" 2>&1 | tail -3 || { _err "git clone failed."; rm -rf "$_tmp"; return 1; }
+    # کپی همه‌چیز به جز .env و دیتابیس
+    rsync -a --exclude='.env' --exclude='*.db' --exclude='__pycache__' "$_tmp/" "$BOT_DIR/" 2>/dev/null \
+      || { _err "rsync failed."; rm -rf "$_tmp"; return 1; }
+    rm -rf "$_tmp"
+  fi
+  chmod +x "$BOT_DIR/nexo-bot" 2>/dev/null || true
+  ln -sf "$BOT_DIR/nexo-bot" /usr/local/bin/nexo-bot 2>/dev/null || true
+  _ok "Bot code updated."
+  return 0
+}
+
+# Rebuild Docker image و restart container ربات
+_update_rebuild_bot_docker() {
+  echo ""
+  echo -e "  ${BOLD}━━━ Rebuilding bot container ━━━${RESET}"
+  echo ""
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    _warn "docker-compose.yml not found — skipping Docker rebuild."
+    return 0
+  fi
+  _info "Building new image (no cache)..."
+  _dc build --no-cache bot 2>&1 | grep -E "(Step|Successfully|error|Error|=>)" | tail -15 || { _err "Docker build failed."; return 1; }
+  _info "Recreating container with new image..."
+  _dc up -d --force-recreate bot 2>&1 | tail -3 || { _err "Docker recreate failed."; return 1; }
+  _ok "Bot container rebuilt and running."
+  return 0
+}
+
+# Rebuild پنل — pnpm install + build + systemctl restart
+_update_rebuild_panel() {
+  echo ""
+  echo -e "  ${BOLD}━━━ Rebuilding web panel ━━━${RESET}"
+  echo ""
+
+  # آیا پنل نصب شده؟
+  if ! _panel_is_enabled; then
+    _info "Web Panel is not enabled — skipping panel update."
+    return 0
+  fi
+
+  if [[ ! -d "$PANEL_DIR" ]]; then
+    _warn "Panel directory not found: $PANEL_DIR — skipping."
+    return 0
+  fi
+
+  # ذخیره تنظیمات فعلی پنل
+  local _wpath _wuser _wpass _wport
+  _wpath=$(_env_read "$PANEL_ENV_LOCAL" "WEB_PANEL_PATH" "/nexora")
+  _wuser=$(_env_read "$PANEL_ENV_LOCAL" "WEB_PANEL_USER" "admin")
+  _wpass=$(_env_read "$PANEL_ENV_LOCAL" "WEB_PANEL_PASS" "")
+  _wport=$(_env_read "$PANEL_ENV_LOCAL" "WEB_PANEL_PORT" "3000")
+
+  # بررسی وجود nexora-panel.zip در BOT_DIR (بعد از git pull باید آنجا باشه)
+  local _panel_zip="$BOT_DIR/nexora-panel.zip"
+  if [[ ! -f "$_panel_zip" ]]; then
+    _warn "nexora-panel.zip not found in $BOT_DIR — skipping panel rebuild."
+    _info "(Panel source should be bundled in the bot repository)"
+    return 0
+  fi
+
+  _info "Extracting new panel source..."
+  local _tmp_panel; _tmp_panel=$(mktemp -d)
+  unzip -q "$_panel_zip" -d "$_tmp_panel" 2>/dev/null || { _err "Panel zip extraction failed."; rm -rf "$_tmp_panel"; return 1; }
+
+  # اگه unzip یک زیرپوشه ساخت، محتوا رو بیار بالا
+  local _inner; _inner=$(find "$_tmp_panel" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+  if [[ -n "$_inner" && -f "$_inner/package.json" ]]; then
+    local _tmp2; _tmp2=$(mktemp -d)
+    rsync -a "$_inner/" "$_tmp2/" && rm -rf "$_tmp_panel" && _tmp_panel="$_tmp2"
+  fi
+
+  if [[ ! -f "$_tmp_panel/package.json" ]]; then
+    _err "Invalid panel zip — package.json not found."
+    rm -rf "$_tmp_panel"
+    return 1
+  fi
+
+  # جایگزین کردن سورس کد پنل (بدون لمس .env.local)
+  _info "Syncing panel source (preserving .env.local)..."
+  rsync -a --exclude='.env.local' --exclude='node_modules/' --exclude='.next/' \
+    "$_tmp_panel/" "$PANEL_DIR/" 2>/dev/null || { _err "Panel sync failed."; rm -rf "$_tmp_panel"; return 1; }
+  rm -rf "$_tmp_panel"
+  _ok "Panel source updated."
+
+  # .env.local رو دوباره تأیید کن که دست نخورده باشه
+  if [[ ! -f "$PANEL_ENV_LOCAL" ]]; then
+    _warn ".env.local missing — recreating from current settings..."
+    _write_panel_env "$_wpath" "$_wuser" "$_wpass" "$_wport" "true"
+  fi
+
+  # pnpm install + build
+  if ! command -v pnpm &>/dev/null; then
+    _info "Installing pnpm..."
+    npm install -g pnpm@latest &>/dev/null || { _err "pnpm install failed."; return 1; }
+  fi
+
+  _info "Installing dependencies..."
+  ( cd "$PANEL_DIR" && pnpm install --no-frozen-lockfile --ignore-scripts 2>&1 | tail -5 ) \
+    || { _err "pnpm install failed."; return 1; }
+  ( cd "$PANEL_DIR" && pnpm rebuild better-sqlite3 2>&1 | tail -3 ) 2>/dev/null || true
+
+  _info "Building panel (production)..."
+  ( cd "$PANEL_DIR" && NODE_ENV=production pnpm build 2>&1 | tail -8 ) \
+    || { _err "pnpm build failed."; return 1; }
+  _ok "Panel build complete."
+
+  # ری‌استارت سرویس
+  _info "Restarting panel service..."
+  systemctl restart "$PANEL_SYSTEMD_SERVICE" 2>/dev/null && sleep 3 || true
+  systemctl is-active "$PANEL_SYSTEMD_SERVICE" &>/dev/null \
+    && _ok "Panel service restarted successfully." \
+    || _warn "Panel service issue — check: journalctl -u $PANEL_SYSTEMD_SERVICE -n 20"
+  return 0
+}
+
+# ── منوی اصلی آپدیت ──────────────────────────────────────────
+_menu_update() {
+  _banner
+  echo -e "  ${BOLD}🔄  Update Nexora${RESET}"
+  _line
+  _update_show_version
+
+  # انتخاب مخزن
+  _update_pick_repo || { _press; return; }
+
+  echo ""
+  echo -e "  ${BOLD}Selected:${RESET}  ${CYAN}${PICKED_REPO_NAME}${RESET}"
+  echo -e "  ${DIM}${PICKED_REPO}${RESET}"
+  echo ""
+  echo -e "  ${YELLOW}What will happen:${RESET}"
+  echo -e "  ${DIM}1.${RESET}  Pre-update backup  (bot .env + panel .env.local + DB)"
+  echo -e "  ${DIM}2.${RESET}  Pull latest bot code  (your .env will NOT be touched)"
+  echo -e "  ${DIM}3.${RESET}  Rebuild Docker image + restart bot container"
+  echo -e "  ${DIM}4.${RESET}  Rebuild web panel  (your panel settings kept)"
+  echo ""
+  echo -e "  ${GREEN}✔  Database and all settings will be preserved.${RESET}"
+  _line
+  read -rp "  Proceed with update? (y/N): " _confirm
+  [[ "$_confirm" =~ ^[Yy]$ ]] || { _warn "Update cancelled."; _press; return; }
+
+  echo ""
+  echo -e "  ${CYAN}${BOLD}Starting update...${RESET}"
+  _line
+
+  local _failed=0
+
+  # ── Step 1: بک‌آپ ──
+  echo -e "\n  ${BOLD}[1/4]${RESET}  Pre-update backup..."
+  _update_pre_backup
+
+  # ── Step 2: آپدیت کد ربات ──
+  echo -e "\n  ${BOLD}[2/4]${RESET}  Updating bot code from GitHub..."
+  _update_bot_files "$PICKED_REPO" || { _err "Bot update failed."; (( _failed++ )) || true; }
+
+  # ── Step 3: Rebuild Docker ──
+  if (( _failed == 0 )); then
+    echo -e "\n  ${BOLD}[3/4]${RESET}  Rebuilding bot container..."
+    _update_rebuild_bot_docker || { _warn "Docker rebuild failed — bot may be running old image."; (( _failed++ )) || true; }
+  else
+    _warn "[3/4] Skipped (due to previous error)."
+  fi
+
+  # ── Step 4: Rebuild panel ──
+  echo -e "\n  ${BOLD}[4/4]${RESET}  Rebuilding web panel..."
+  _update_rebuild_panel || _warn "Panel rebuild failed — panel may be running old version."
+
+  # ── نتیجه نهایی ──
+  echo ""
+  _line
+  if (( _failed == 0 )); then
+    echo -e "  ${GREEN}${BOLD}✔  Update complete!${RESET}"
+    echo ""
+    # نمایش نسخه جدید
+    if [[ -d "$BOT_DIR/.git" ]]; then
+      local _new_commit; _new_commit=$(git -C "$BOT_DIR" log --oneline -1 2>/dev/null || echo "")
+      [[ -n "$_new_commit" ]] && echo -e "  ${BOLD}New version:${RESET}  ${CYAN}${_new_commit}${RESET}"
+    fi
+  else
+    echo -e "  ${YELLOW}${BOLD}⚠  Update finished with warnings.${RESET}"
+    echo -e "  ${DIM}Check messages above. Pre-update backups saved to /root/nexora_pre_update_*${RESET}"
+    echo -e "  ${DIM}To restore: Backup & Restore → [7] Restore DB / [8] Restore .env${RESET}"
+  fi
+  echo ""
+  _press
+}
+
+# ────────────────────────────────────────────────────────────────
 #  MAIN MENU
 # ────────────────────────────────────────────────────────────────
 main() {
@@ -1672,6 +2003,7 @@ main() {
     echo -e "  ${BOLD}[7]${RESET}  🔒  SSL Manager       (Let's Encrypt certificate)"
     echo -e "  ${BOLD}[8]${RESET}  🔗  Webhook Manager   (manage webhook URLs)"
     echo -e "  ${BOLD}[9]${RESET}  🌐  Web Panel         (enable / manage admin panel)"
+    echo -e "  ${BOLD}[U]${RESET}  ${GREEN}🔄  Update${RESET}           (bot + panel — data & settings kept)"
     echo -e "  ${BOLD}[0]${RESET}  ${DIM}Exit${RESET}"
     _line
     echo -e "  ${DIM}Dir: $BOT_DIR${RESET}"
@@ -1687,6 +2019,7 @@ main() {
       7) _menu_ssl ;;
       8) _menu_webhook ;;
       9) _menu_webpanel ;;
+      u|U) _menu_update ;;
       0) echo ""; exit 0 ;;
       *) _warn "Invalid option." ;;
     esac
