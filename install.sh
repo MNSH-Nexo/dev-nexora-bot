@@ -462,6 +462,283 @@ _ensure_unzip() {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  xui.ts patcher — v3
+#  جایگزین کردن lib/xui.ts با نسخه‌ای که:
+#  - redirect: manual (جلوگیری از گم شدن Set-Cookie)
+#  - form-encoded login fallback (برای نسخه‌های قدیمی 3X-UI)
+#  - session TTL 30 دقیقه (re-login خودکار)
+#  - timeout 20 ثانیه (به جای 15)
+# ══════════════════════════════════════════════════════════════
+_patch_xui_ts() {
+  local _target="$1"
+  cat > "$_target" <<'XUIEOF'
+/**
+ * lib/xui.ts — v3 (VPS-patched by installer)
+ * تغییرات: redirect:manual + form-encoded fallback + session TTL + timeout 20s
+ */
+
+function getPanelConfig() {
+  const url      = (process.env.PANEL_URL      ?? "").trim().replace(/\/$/, "");
+  const username = (process.env.PANEL_USERNAME ?? "admin").trim();
+  const password = (process.env.PANEL_PASSWORD ?? "").trim();
+  return { url, username, password };
+}
+
+function withTlsBypass<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  return fn().finally(() => {
+    if (prev === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev;
+  });
+}
+
+function extractCookies(res: Response): string {
+  if (typeof res.headers.getSetCookie === "function") {
+    const cs = res.headers.getSetCookie();
+    if (cs.length > 0) return cs.map((c: string) => c.split(";")[0]).join("; ");
+  }
+  const s = res.headers.get("set-cookie") ?? "";
+  return s ? s.split(";")[0] : "";
+}
+
+function mergeCookies(base: string, over: string): string {
+  if (!base) return over;
+  if (!over)  return base;
+  if (base === over) return base;
+  try {
+    const parse = (s: string) => Object.fromEntries(
+      s.split(";").map(p => { const [k,...v] = p.trim().split("="); return [k.trim(), v.join("=")] as [string,string]; })
+    );
+    const merged = { ...parse(base), ...parse(over) };
+    return Object.entries(merged).filter(([k]) => k).map(([k,v]) => v ? `${k}=${v}` : k).join("; ");
+  } catch { return over || base; }
+}
+
+function extractCsrfToken(html: string): string {
+  const m = html.match(/<meta\s+name=["']csrf-token["']\s+content=["']([^"']+)["']/i)
+         ?? html.match(/<meta\s+content=["']([^"']+)["']\s+name=["']csrf-token["']/i)
+         ?? html.match(/csrfToken['":\s]+["']([a-zA-Z0-9_-]{20,})["']/i);
+  return m?.[1] ?? "";
+}
+
+let _sessionCookie = "";
+let _csrfToken     = "";
+let _loggedIn      = false;
+let _lastLoginAt   = 0;
+
+function resetSession() {
+  _sessionCookie = ""; _csrfToken = ""; _loggedIn = false; _lastLoginAt = 0;
+}
+
+async function fetchCsrfToken(panelUrl: string): Promise<{ cookie: string; csrf: string }> {
+  return withTlsBypass(async () => {
+    try {
+      const res = await fetch(`${panelUrl}/`, {
+        method: "GET", redirect: "manual",
+        headers: { Accept: "text/html,*/*", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept-Language": "en-US,en;q=0.9" },
+        signal: AbortSignal.timeout(20_000),
+      });
+      const initCookie = extractCookies(res);
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location") ?? "";
+        if (loc) {
+          try {
+            const res2 = await fetch(loc.startsWith("http") ? loc : `${panelUrl}${loc}`, {
+              headers: { Accept: "text/html,*/*", "User-Agent": "Mozilla/5.0", ...(initCookie ? { Cookie: initCookie } : {}) },
+              signal: AbortSignal.timeout(20_000),
+            });
+            const html2 = await res2.text();
+            return { cookie: mergeCookies(initCookie, extractCookies(res2)), csrf: extractCsrfToken(html2) };
+          } catch { /* ignore */ }
+        }
+      }
+      const html = await res.text();
+      return { cookie: initCookie, csrf: extractCsrfToken(html) };
+    } catch { return { cookie: "", csrf: "" }; }
+  });
+}
+
+async function performLogin(panelUrl: string, username: string, password: string, initialCookie: string, csrfToken: string): Promise<string | null> {
+  return withTlsBypass(async () => {
+    const base: Record<string,string> = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Origin": panelUrl, "Referer": `${panelUrl}/`,
+      ...(initialCookie ? { Cookie: initialCookie } : {}),
+      ...(csrfToken     ? { "X-CSRF-Token": csrfToken } : {}),
+    };
+
+    // روش ۱: JSON
+    const tryJson = async (): Promise<string | null> => {
+      const res = await fetch(`${panelUrl}/login`, {
+        method: "POST", redirect: "manual",
+        headers: { ...base, "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username, password }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const sc = extractCookies(res);
+      if (sc) return mergeCookies(initialCookie, sc);
+      if ((res.status >= 300 && res.status < 400) || res.ok) {
+        const loc = res.headers.get("location") ?? "";
+        if (loc) {
+          try {
+            const r2 = await fetch(loc.startsWith("http") ? loc : `${panelUrl}${loc}`, { redirect:"manual", headers:{...base, Cookie: initialCookie}, signal: AbortSignal.timeout(10_000) });
+            const sc2 = extractCookies(r2);
+            if (sc2) return mergeCookies(initialCookie, sc2);
+          } catch { /* ignore */ }
+        }
+        try {
+          const body = await res.text();
+          if (body.includes('"success":true')) return initialCookie || null;
+        } catch { /* ignore */ }
+      }
+      return null;
+    };
+
+    // روش ۲: form-encoded
+    const tryForm = async (): Promise<string | null> => {
+      const res = await fetch(`${panelUrl}/login`, {
+        method: "POST", redirect: "manual",
+        headers: { ...base, "Content-Type": "application/x-www-form-urlencoded", Accept: "text/html,*/*" },
+        body: new URLSearchParams({ username, password }).toString(),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const sc = extractCookies(res);
+      return sc ? mergeCookies(initialCookie, sc) : null;
+    };
+
+    const r1 = await tryJson();
+    if (r1) return r1;
+    return await tryForm();
+  });
+}
+
+export async function xuiLogin(): Promise<string | null> {
+  const { url, username, password } = getPanelConfig();
+  if (!url || !password) return null;
+  try {
+    const { cookie: ic, csrf } = await fetchCsrfToken(url);
+    const sc = await performLogin(url, username, password, ic, csrf);
+    if (!sc) return null;
+    _sessionCookie = sc; _csrfToken = csrf; _loggedIn = true; _lastLoginAt = Date.now();
+    return sc;
+  } catch { resetSession(); return null; }
+}
+
+async function xuiFetchWithSession(url: string, init: RequestInit = {}): Promise<Response | null> {
+  if (!_loggedIn || (Date.now() - _lastLoginAt) > 30 * 60 * 1000) {
+    if (!await xuiLogin()) return null;
+  }
+  return withTlsBypass(async () => {
+    const { url: pu } = getPanelConfig();
+    const h: Record<string,string> = {
+      ...(init.headers as Record<string,string> ?? {}),
+      Cookie: _sessionCookie, "User-Agent": "Mozilla/5.0", Referer: `${pu}/`,
+      ..._csrfToken ? { "X-CSRF-Token": _csrfToken } : {},
+    };
+    const res = await fetch(url, { ...init, headers: h, signal: init.signal ?? AbortSignal.timeout(20_000) });
+    if (res.status === 401 || res.status === 403) {
+      resetSession();
+      if (!await xuiLogin()) return null;
+      return withTlsBypass(() => fetch(url, { ...init, headers: { ...(init.headers as Record<string,string> ?? {}), Cookie: _sessionCookie, "X-CSRF-Token": _csrfToken, "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(20_000) }));
+    }
+    return res;
+  });
+}
+
+export async function xuiGetInbounds(): Promise<Array<Record<string, unknown>> | null> {
+  const { url } = getPanelConfig();
+  if (!url) return null;
+  try {
+    const res = await xuiFetchWithSession(`${url}/panel/api/inbounds/list`, { headers: { Accept: "application/json" } });
+    if (!res || !res.ok) return null;
+    const data = await res.json() as { success: boolean; obj?: unknown[] };
+    if (!data.success) return null;
+    return (data.obj as Array<Record<string, unknown>>) ?? null;
+  } catch { return null; }
+}
+
+export type XuiServerStatus = {
+  cpu: number; cpuCores: number;
+  mem: { used: number; total: number }; swap: { used: number; total: number }; disk: { used: number; total: number };
+  uptime: number; loads: number[]; xrayState: string; xrayVersion: string; panelVersion: string;
+  netIO: { up: number; down: number }; tcpCount: number; udpCount: number;
+};
+
+export async function xuiGetServerStatus(): Promise<XuiServerStatus | null> {
+  const { url } = getPanelConfig();
+  if (!url) return null;
+  try {
+    const res = await xuiFetchWithSession(`${url}/panel/api/server/status`, { headers: { Accept: "application/json" } });
+    if (!res || !res.ok) return null;
+    const data = await res.json() as { success: boolean; obj?: Record<string, unknown> };
+    if (!data.success || !data.obj) return null;
+    const o = data.obj;
+    const mem  = o.mem  as { current: number; total: number } | undefined;
+    const swap = o.swap as { current: number; total: number } | undefined;
+    const disk = o.disk as { current: number; total: number } | undefined;
+    const xray = o.xray as { state: string; version: string } | undefined;
+    const netIO = o.netIO as { up: number; down: number } | undefined;
+    return {
+      cpu: typeof o.cpu === "number" ? Math.round(o.cpu) : 0,
+      cpuCores: typeof o.cpuCores === "number" ? o.cpuCores : 1,
+      mem:  { used: mem?.current  ?? 0, total: mem?.total  ?? 0 },
+      swap: { used: swap?.current ?? 0, total: swap?.total ?? 0 },
+      disk: { used: disk?.current ?? 0, total: disk?.total ?? 0 },
+      uptime:       typeof o.uptime === "number" ? o.uptime : 0,
+      loads:        Array.isArray(o.loads) ? (o.loads as number[]) : [0,0,0],
+      xrayState:    xray?.state   ?? "unknown",
+      xrayVersion:  xray?.version ?? "",
+      panelVersion: typeof o.panelVersion === "string" ? o.panelVersion : "",
+      netIO:    { up: netIO?.up ?? 0, down: netIO?.down ?? 0 },
+      tcpCount: typeof o.tcpCount === "number" ? o.tcpCount : 0,
+      udpCount: typeof o.udpCount === "number" ? o.udpCount : 0,
+    };
+  } catch { return null; }
+}
+
+export async function xuiPing(): Promise<{ reachable: boolean; loginOk: boolean; csrfFound: boolean; error?: string }> {
+  const { url, password } = getPanelConfig();
+  if (!url)      return { reachable: false, loginOk: false, csrfFound: false, error: "PANEL_URL not set" };
+  if (!password) return { reachable: false, loginOk: false, csrfFound: false, error: "PANEL_PASSWORD not set" };
+  try {
+    const { url: u, username, password: pass } = getPanelConfig();
+    const { cookie: ic, csrf } = await fetchCsrfToken(u);
+    const sc = await performLogin(u, username, pass, ic, csrf);
+    if (sc) { _sessionCookie = sc; _csrfToken = csrf; _loggedIn = true; _lastLoginAt = Date.now(); }
+    return { reachable: true, loginOk: !!sc, csrfFound: !!csrf };
+  } catch (e: unknown) {
+    return { reachable: false, loginOk: false, csrfFound: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export function getPanelStatus(): { configured: boolean; url: string; username: string } {
+  const { url, username, password } = getPanelConfig();
+  return { configured: !!(url && password), url, username };
+}
+
+export function clearXuiSession(): void { resetSession(); }
+
+export interface XuiNewClient { email: string; subId: string; subLink: string; inboundId: number; }
+
+export async function xuiAddClient(inboundId: number, email: string, trafficGb = 0, expireDays = 30, limitIp = 0, tgId = 0): Promise<XuiNewClient | null> {
+  const { url } = getPanelConfig();
+  if (!url) return null;
+  const subId = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,"0")).join("");
+  const totalBytes = trafficGb  > 0 ? trafficGb  * 1024 * 1024 * 1024 : 0;
+  const expiryTs   = expireDays > 0 ? Date.now() + expireDays * 86400 * 1000 : 0;
+  const payload = { client: { email, totalGB: totalBytes, expiryTime: expiryTs, tgId, limitIp, enable: true, subId, reset: 0 }, inboundIds: [inboundId] };
+  const res = await xuiFetchWithSession(`${url}/panel/api/clients/add`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (!res || !res.ok) return null;
+  const data = await res.json() as { success?: boolean };
+  if (!data.success) return null;
+  const subBase = url.replace(/\/[a-zA-Z0-9_-]{10,}$/, "");
+  return { email, subId, subLink: `${subBase}/sub/${subId}`, inboundId };
+}
+XUIEOF
+}
+
+# ══════════════════════════════════════════════════════════════
 #  Web Panel installer — نسخه Hybrid Stable
 # ══════════════════════════════════════════════════════════════
 _install_webpanel() {
@@ -531,7 +808,6 @@ print('package.json start script cleaned')
   fi
 
   # ── patch next.config.ts — allowedDevOrigins: ["*"] ───────
-  # (از نسخه B نگه داشته شده)
   local _ncfg="$PANEL_INSTALL_DIR/next.config.ts"
   if [[ -f "$_ncfg" ]]; then
     python3 -c "
@@ -545,6 +821,20 @@ if '\"*\"' not in c:
 else:
     print('next.config.ts already has wildcard origin')
 " "$_ncfg" 2>/dev/null || _warn "Could not patch next.config.ts"
+  fi
+
+  # ── patch lib/xui.ts — v3 (redirect + form-encoded login) ─────
+  # مشکل اصلی: نسخه اصلی xui.ts با redirect: "follow" (پیش‌فرض)
+  # Set-Cookie header را گم می‌کند. همچنین بعضی نسخه‌های 3X-UI
+  # فقط form-encoded login قبول می‌کنند نه JSON.
+  local _xui_dir="$PANEL_INSTALL_DIR/lib"
+  local _xui_ts="$_xui_dir/xui.ts"
+  if [[ -d "$_xui_dir" ]]; then
+    _info "Patching lib/xui.ts (v3 — redirect fix + form-encoded fallback)..."
+    _patch_xui_ts "$_xui_ts"
+    _ok "lib/xui.ts patched ✓"
+  else
+    _warn "lib/ directory not found — skipping xui.ts patch"
   fi
 
   # ── 4. Write .env.local BEFORE build ──────────────────────
@@ -573,6 +863,38 @@ else:
     _ask "PANEL_URL (e.g. https://your-server:8443/webpath)" _pu
   fi
 
+  # ── پیدا کردن مسیر واقعی DB (نه فرض کردن) ───────────────────────
+  # Docker volume ممکنه با اسم متفاوت یا در مسیر متفاوت باشه
+  # این کد مسیر واقعی را detect می‌کند
+  local _real_db=""
+  local _db_candidates=(
+    "/var/lib/docker/volumes/nexora_bot_data/_data/bot_data.db"
+    "/var/lib/docker/volumes/nexora_bot_data/_data/bot.db"
+    "/opt/nexora-bot/data/bot_data.db"
+    "/opt/nexora-bot/data/bot.db"
+  )
+
+  # اگه Docker volume وجود داره، فایل‌های داخلش رو هم چک کن
+  if [[ -d "/var/lib/docker/volumes/nexora_bot_data/_data" ]]; then
+    local _found_in_vol
+    _found_in_vol=$(find /var/lib/docker/volumes/nexora_bot_data/_data/ -name "*.db" 2>/dev/null | head -1 || true)
+    [[ -n "$_found_in_vol" ]] && _db_candidates=("$_found_in_vol" "${_db_candidates[@]}")
+  fi
+
+  for _c in "${_db_candidates[@]}"; do
+    if [[ -f "$_c" ]]; then
+      _real_db="$_c"
+      _ok "Found bot DB at: $_real_db"
+      break
+    fi
+  done
+
+  if [[ -z "$_real_db" ]]; then
+    _warn "Bot DB not found yet — using default path (bot may not be running)"
+    _warn "DB will be found automatically after bot starts"
+    _real_db="$_vol_db"
+  fi
+
   cat > "$PANEL_INSTALL_DIR/.env.local" <<ENVEOF
 NODE_ENV=production
 WEB_PANEL_PATH=${_wp_path}
@@ -585,12 +907,14 @@ ADMIN_IDS=${_ai}
 PANEL_URL=${_pu}
 PANEL_USERNAME=${_pn}
 PANEL_PASSWORD=${_pp}
-BOT_DB_PATH=${_vol_db}
+BOT_DB_PATH=${_real_db}
+# TLS bypass برای پنل‌های با self-signed certificate (مثل 3X-UI)
+NODE_TLS_REJECT_UNAUTHORIZED=0
 ENVEOF
   chmod 600 "$PANEL_INSTALL_DIR/.env.local"
   _ok "Config written"
   _info "  PANEL_URL  = ${_pu:-❌ empty — set later in Security page}"
-  _info "  DB_PATH    = ${_vol_db}"
+  _info "  DB_PATH    = ${_real_db}"
 
   # ── 5. Install dependencies — Hybrid Stable ───────────────
   _step "Installing dependencies (may take 2-5 min on low-RAM servers)..."
@@ -819,13 +1143,60 @@ SVCEOF
   systemctl stop   nexora-panel 2>/dev/null || true
   sleep 1
   systemctl start  nexora-panel
-  sleep 3
+  sleep 5
 
   if systemctl is-active nexora-panel &>/dev/null; then
     _ok "Panel service running ✓"
   else
     _warn "Service may have issues. Check: journalctl -u nexora-panel -n 30"
     journalctl -u nexora-panel -n 8 --no-pager 2>/dev/null || true
+  fi
+
+  # ── post-start diagnostic ─────────────────────────────────
+  _step "Running connectivity diagnostics..."
+
+  # ① DB check
+  local _db_check="${_real_db}"
+  if [[ -f "$_db_check" ]]; then
+    _ok "DB file exists: $_db_check ($(du -sh "$_db_check" 2>/dev/null | cut -f1))"
+    # permission check — nexora-panel با root اجرا می‌شه، باید readable باشه
+    if [[ -r "$_db_check" ]]; then
+      _ok "DB file is readable ✓"
+    else
+      _warn "DB file not readable — fixing permissions..."
+      chmod 644 "$_db_check" 2>/dev/null && _ok "DB permissions fixed" || \
+        _warn "Could not fix DB permissions"
+    fi
+  else
+    _warn "DB file not found at: $_db_check"
+    _warn "This is normal if bot hasn't run yet. Bot creates DB on first start."
+    # اگه bot در حال اجرا است، کمی صبر کنیم
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "nexora_bot"; then
+      _info "Waiting 5s for bot to create DB..."
+      sleep 5
+      [[ -f "$_db_check" ]] && _ok "DB created: $_db_check" || \
+        _warn "DB still not found — panel will show 'database unavailable' until bot creates it"
+    fi
+  fi
+
+  # ② PANEL_URL connectivity check (اگه تنظیم شده)
+  if [[ -n "${_pu:-}" ]]; then
+    _info "Testing connection to 3X-UI panel..."
+    local _xui_http_code
+    _xui_http_code=$(curl -sk --max-time 10 -o /dev/null -w "%{http_code}" \
+      "${_pu%/}/" 2>/dev/null || echo "000")
+    if [[ "$_xui_http_code" =~ ^(200|301|302|303|307|308)$ ]]; then
+      _ok "3X-UI panel reachable (HTTP $_xui_http_code) ✓"
+    elif [[ "$_xui_http_code" == "000" ]]; then
+      _warn "3X-UI panel not reachable from this server (timeout/network)"
+      _warn "URL: ${_pu}"
+      _warn "Panel dashboard will show 'panel unavailable' — check:"
+      _warn "  1. پنل 3X-UI در حال اجرا است؟"
+      _warn "  2. پورت ${_pu##*:} در فایروال سرور پنل باز است؟"
+      _warn "  3. آدرس PANEL_URL درست است؟"
+    else
+      _info "3X-UI panel responded HTTP $_xui_http_code (may need login)"
+    fi
   fi
 
   # ── 8. Firewall ───────────────────────────────────────────
