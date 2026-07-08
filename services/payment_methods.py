@@ -6,13 +6,15 @@ services/payment_methods.py — فعال/غیرفعال کردن روش‌های
   payment_card_enabled    → "1" / "0"
   payment_crypto_invoice  → "1" / "0"   (فقط برای NOWPayments)
   crypto_gateway          → "nowpayments" | "maxelpay"
+  price_display_mode      → "both" | "usd" | "toman"
 """
 from __future__ import annotations
 
-CRYPTO_KEY         = "payment_crypto_enabled"
-CARD_KEY           = "payment_card_enabled"
-CRYPTO_INVOICE_KEY = "payment_crypto_invoice"   # "1" = Invoice | "0" = USDT مستقیم
-CRYPTO_GATEWAY_KEY = "crypto_gateway"           # "nowpayments" | "maxelpay"
+CRYPTO_KEY           = "payment_crypto_enabled"
+CARD_KEY             = "payment_card_enabled"
+CRYPTO_INVOICE_KEY   = "payment_crypto_invoice"   # "1" = Invoice | "0" = USDT مستقیم
+CRYPTO_GATEWAY_KEY   = "crypto_gateway"           # "nowpayments" | "maxelpay"
+PRICE_DISPLAY_KEY    = "price_display_mode"       # "both" | "usd" | "toman"
 
 
 async def is_crypto_enabled() -> bool:
@@ -76,15 +78,38 @@ async def set_crypto_gateway(gateway: str) -> None:
         await set_setting(s, CRYPTO_GATEWAY_KEY, gateway)
 
 
+async def get_price_display_mode() -> str:
+    """
+    حالت نمایش قیمت در لیست پلن‌ها.
+    مقادیر: "both" (هر دو) | "usd" (فقط دلار) | "toman" (فقط تومان)
+    """
+    from database import AsyncSessionLocal
+    from database.crud import get_setting
+    async with AsyncSessionLocal() as s:
+        return await get_setting(s, PRICE_DISPLAY_KEY, "both")
+
+
+async def set_price_display_mode(mode: str) -> None:
+    """تنظیم حالت نمایش قیمت."""
+    if mode not in ("both", "usd", "toman"):
+        raise ValueError(f"حالت نمایش نامعتبر: {mode}")
+    from database import AsyncSessionLocal
+    from database.crud import set_setting
+    async with AsyncSessionLocal() as s:
+        await set_setting(s, PRICE_DISPLAY_KEY, mode)
+
+
 async def get_payment_status() -> dict:
     """وضعیت همه روش‌های پرداخت به صورت dict."""
     crypto         = await is_crypto_enabled()
     card           = await is_card_enabled()
     crypto_invoice = await is_crypto_invoice()
     crypto_gateway = await get_crypto_gateway()
+    price_display  = await get_price_display_mode()
     return {
         "crypto":         crypto,
         "card":           card,
         "crypto_invoice": crypto_invoice,
         "crypto_gateway": crypto_gateway,
+        "price_display":  price_display,
     }

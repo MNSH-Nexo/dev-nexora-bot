@@ -230,6 +230,11 @@ async def main() -> None:
     # ── ایجاد پلن‌های پیش‌فرض اگر هیچ پلنی وجود ندارد ──
     await _seed_default_plans()
 
+    # ── بارگذاری تم ربات از DB (cache پر می‌شود) ──
+    from services.theme import get_current_theme as _load_theme
+    await _load_theme()
+    logger.success("تم ربات بارگذاری شد ✓")
+
     # ── پاک‌سازی تراکنش‌های کریپتوی منقضی‌شده (startup) ──
     # این مخصوصاً برای مواقع restore بک‌آپ لازم است:
     # تراکنش‌هایی که expires_at گذشته ولی status هنوز waiting است

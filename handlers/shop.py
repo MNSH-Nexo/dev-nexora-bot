@@ -11,6 +11,7 @@ Flow خرید:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -27,7 +28,7 @@ from database.crud import (
     get_active_plans, has_used_test_subscription,
     record_test_subscription, use_discount_code, validate_discount,
 )
-from keyboards.main_menu import get_main_menu
+from keyboards.main_menu import get_main_menu, get_main_menu_async
 from keyboards.plans import (
     get_confirm_after_discount_keyboard, get_payment_status_keyboard,
     get_plan_confirm_keyboard, get_plans_keyboard,
@@ -39,6 +40,11 @@ from services.banner import send_with_banner
 from services.payment_methods import get_payment_status
 
 router = Router(name="shop")
+
+# ── قفل جلوگیری از race condition در اشتراک تست ──
+# هر telegram_id یک lock جداگانه دارد تا کلیک‌های همزمان
+# نتوانند چندین اشتراک تست برای یک کاربر بسازند
+_test_sub_locks: dict[int, asyncio.Lock] = {}
 
 
 # ──────────────────────────────────────────────
@@ -149,7 +155,7 @@ def _fmt_usdt(price: float) -> str:
 
 
 async def _fmt_plan_with_price(plan) -> str:
-    """فرمت پلن با نمایش قیمت دلاری + تومانی (اگر نرخ تنظیم شده)."""
+    """فرمت پلن با نمایش قیمت — بر اساس تنظیم نمایش قیمت ادمین."""
     if plan.traffic_gb == 0:
         if plan.limit_ip and plan.limit_ip > 0:
             user_label = _FARSI_USERS.get(plan.limit_ip, f"{plan.limit_ip} کاربره")
@@ -161,16 +167,30 @@ async def _fmt_plan_with_price(plan) -> str:
 
     rate = await _get_usdt_rate()
     price_str = _fmt_usdt(plan.price_usdt)
-    if rate and rate > 0:
-        toman = int(plan.price_usdt * rate)
-        price_line = (
-            f"💵 قیمت: `{price_str} USDT`  —  `{toman:,} تومان`"
-        )
-    else:
-        price_line = (
-            f"💵 قیمت: `{price_str} USDT`\n"
-            f"_⚠️ برای نمایش قیمت تومانی، نرخ را در پنل تنظیم کنید_"
-        )
+
+    from services.payment_methods import get_price_display_mode
+    display_mode = await get_price_display_mode()
+
+    if display_mode == "usd":
+        price_line = f"💵 قیمت: `{price_str} USDT`"
+    elif display_mode == "toman":
+        if rate and rate > 0:
+            toman = int(plan.price_usdt * rate)
+            price_line = f"🪙 قیمت: `{toman:,} تومان`"
+        else:
+            price_line = (
+                f"🪙 قیمت: _نرخ تنظیم نشده_\n"
+                f"_در پنل ادمین نرخ تومان را وارد کنید_"
+            )
+    else:  # "both" (پیش‌فرض)
+        if rate and rate > 0:
+            toman = int(plan.price_usdt * rate)
+            price_line = f"💵 قیمت: `{price_str} USDT`  —  `{toman:,} تومان`"
+        else:
+            price_line = (
+                f"💵 قیمت: `{price_str} USDT`\n"
+                f"_⚠️ برای نمایش قیمت تومانی، نرخ را در پنل تنظیم کنید_"
+            )
 
     return (
         f"📦 *{plan.name}*\n"
@@ -215,14 +235,14 @@ def _xui_client() -> XUIClient:
 # 🛒 خرید کانفیگ — منوی اصلی
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "🛒 خرید کانفیگ")
+@router.message(F.text.contains("خرید کانفیگ"))
 async def msg_buy(message: Message) -> None:
     async with AsyncSessionLocal() as session:
         plans = await get_active_plans(session)
     if not plans:
         await message.answer(
             "⚠️ در حال حاضر پلنی موجود نیست.\nلطفاً بعداً مراجعه کنید.",
-            reply_markup=get_main_menu(),
+            reply_markup=await get_main_menu_async(),
         )
         return
     limited_count = sum(1 for p in plans if p.traffic_gb > 0)
@@ -233,7 +253,12 @@ async def msg_buy(message: Message) -> None:
     if unlimited_count:
         desc_parts.append(f"♾ {unlimited_count} پلن نامحدود")
 
+    from services.payment_methods import get_price_display_mode
     rate = await _get_usdt_rate()
+    display_mode = await get_price_display_mode()
+    # اگر فقط تومان نشان داده می‌شود، rate باید 0 نباشد تا قیمت تومانی محاسبه شود
+    effective_rate = rate if display_mode in ("both", "toman") else 0
+    # برای حالت "toman" نرخ می‌خواهیم اما "usd" نمی‌خواهیم
     await send_with_banner(
         message,
         f"🛒 <b>خرید اشتراک VPN</b>\n"
@@ -241,7 +266,7 @@ async def msg_buy(message: Message) -> None:
         f"{' | '.join(desc_parts)}\n\n"
         "👇 پلن مورد نظر خود را انتخاب کنید:",
         parse_mode="HTML",
-        reply_markup=get_plans_keyboard(plans, rate),
+        reply_markup=get_plans_keyboard(plans, effective_rate, display_mode=display_mode),
     )
 
 
@@ -261,14 +286,17 @@ async def cb_show_plans(callback: CallbackQuery) -> None:
     await callback.answer()
     async with AsyncSessionLocal() as session:
         plans = await get_active_plans(session)
+    from services.payment_methods import get_price_display_mode
     rate = await _get_usdt_rate()
+    display_mode = await get_price_display_mode()
+    effective_rate = rate if display_mode in ("both", "toman") else 0
     await _safe_edit_cb(
         callback,
         "🛒 *خرید اشتراک VPN*\n"
         "━━━━━━━━━━━━━━━\n"
         "👇 پلن مورد نظر خود را انتخاب کنید:",
         parse_mode="Markdown",
-        reply_markup=get_plans_keyboard(plans, rate),
+        reply_markup=get_plans_keyboard(plans, effective_rate, display_mode=display_mode),
     )
 
 
@@ -612,7 +640,7 @@ async def cb_pay_invoice(callback: CallbackQuery) -> None:
 # 🎁 اشتراک تست
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "🎁 اشتراک تست")
+@router.message(F.text.contains("اشتراک تست"))
 async def msg_test_sub(message: Message) -> None:
     tg_user = message.from_user
     if not tg_user:
@@ -632,43 +660,101 @@ async def msg_test_sub(message: Message) -> None:
         )
         return
 
-    traffic_gb    = int(_traffic) if _traffic.isdigit() else settings.test_traffic_gb
-    duration_days = int(_days)    if _days.isdigit()    else settings.test_duration_days
+    # ── پشتیبانی از اعداد اعشاری برای حجم ترافیک (مثلاً 0.05 = 50 MB) ──────────
+    def _parse_traffic(val: str, default: float) -> float:
+        """تبدیل رشته به عدد اعشاری مثبت — پشتیبانی از GB و MB."""
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
 
-    async with AsyncSessionLocal() as session:
-        used = await has_used_test_subscription(session, tg_user.id)
-        if used:
-            await message.answer(
-                "⚠️ شما قبلاً از اشتراک تست استفاده کرده‌اید.\n"
-                "هر آیدی تلگرام فقط یک‌بار می‌تواند اشتراک تست دریافت کند.",
-            )
-            return
+    traffic_gb    = _parse_traffic(_traffic, float(settings.test_traffic_gb))
+    try:
+        duration_days = int(_days) if _days.isdigit() else settings.test_duration_days
+    except (ValueError, AttributeError):
+        duration_days = settings.test_duration_days
 
-        db_user, _ = await get_or_create_user(
-            session, tg_user.id, tg_user.username, tg_user.first_name,
-            admin_ids=settings.admin_ids,
+    # ── قفل race condition — هر کاربر فقط یک درخواست همزمان ──────────────────
+    # از dict قفل‌ها استفاده می‌کنیم تا کلیک‌های پشت‌سرهم را serialize کنیم
+    if tg_user.id not in _test_sub_locks:
+        _test_sub_locks[tg_user.id] = asyncio.Lock()
+    user_lock = _test_sub_locks[tg_user.id]
+
+    if user_lock.locked():
+        # درخواست قبلی هنوز در حال پردازش است
+        await message.answer(
+            "⏳ درخواست شما در حال پردازش است، لطفاً چند لحظه صبر کنید."
         )
+        return
+
+    async with user_lock:
+        # ── بررسی دوباره استفاده پس از گرفتن قفل ─────────────────────────────
+        # این چک داخل قفل انجام می‌شود تا race condition حل شود
+        async with AsyncSessionLocal() as session:
+            used = await has_used_test_subscription(session, tg_user.id)
+            if used:
+                await message.answer(
+                    "⚠️ شما قبلاً از اشتراک تست استفاده کرده‌اید.\n"
+                    "هر آیدی تلگرام فقط یک‌بار می‌تواند اشتراک تست دریافت کند.",
+                )
+                return
+
+            db_user, _ = await get_or_create_user(
+                session, tg_user.id, tg_user.username, tg_user.first_name,
+                admin_ids=settings.admin_ids,
+            )
 
         await message.answer("⏳ در حال ایجاد اشتراک تست...")
 
         try:
-            result = await create_new_subscription(
-                session=session,
-                user_id=db_user.id,
-                telegram_id=tg_user.id,
-                inbound_id=0,
-                traffic_gb=traffic_gb,
-                expire_days=duration_days,
-                is_gift=True,
-            )
-            await record_test_subscription(session, tg_user.id)
+            async with AsyncSessionLocal() as session:
+                result = await create_new_subscription(
+                    session=session,
+                    user_id=db_user.id,
+                    telegram_id=tg_user.id,
+                    inbound_id=0,
+                    traffic_gb=traffic_gb,
+                    expire_days=duration_days,
+                    is_gift=True,
+                )
+            # ثبت استفاده از تست در یک session جداگانه — بعد از موفقیت ایجاد اشتراک
+            async with AsyncSessionLocal() as session2:
+                await record_test_subscription(session2, tg_user.id)
         except XUIError as e:
-            logger.error(f"خطا در ایجاد اشتراک تست: {e}")
-            await message.answer("❌ خطا در ایجاد اشتراک. لطفاً بعداً تلاش کنید.")
+            logger.error(f"خطا در ایجاد اشتراک تست (XUIError) — user={tg_user.id}: {type(e).__name__}: {e}")
+            err_lower = str(e).lower()
+            if "اتصال" in str(e) or "connect" in err_lower or "transport" in err_lower:
+                await message.answer(
+                    "❌ خطا در اتصال به پنل VPN.\n"
+                    "لطفاً چند دقیقه دیگر دوباره تلاش کنید یا با پشتیبانی تماس بگیرید."
+                )
+            elif "inbound" in err_lower or "اینباند" in str(e):
+                await message.answer(
+                    "⚠️ سرور VPN در حال حاضر آماده نیست.\n"
+                    "لطفاً با پشتیبانی تماس بگیرید."
+                )
+            elif "auth" in err_lower or "login" in err_lower or "ورود" in str(e) or "401" in str(e):
+                await message.answer(
+                    "⚠️ خطای احراز هویت پنل.\n"
+                    "لطفاً با پشتیبانی تماس بگیرید."
+                )
+            else:
+                await message.answer(
+                    "❌ خطا در ایجاد اشتراک تست.\n"
+                    "لطفاً بعداً تلاش کنید یا با پشتیبانی تماس بگیرید."
+                )
+            return
+        except Exception as e:
+            logger.error(f"خطای غیرمنتظره در اشتراک تست — user={tg_user.id}: {type(e).__name__}: {e}", exc_info=True)
+            await message.answer(
+                "❌ خطای غیرمنتظره‌ای رخ داد.\n"
+                "لطفاً بعداً تلاش کنید یا با پشتیبانی تماس بگیرید."
+            )
             return
 
+    traffic_label = f"{traffic_gb:g} GB" if traffic_gb >= 1 else f"{traffic_gb * 1024:.0f} MB"
     await message.answer(
-        f"🎁 *اشتراک تست — {traffic_gb}GB / {duration_days} روز*\n"
+        f"🎁 *اشتراک تست — {traffic_label} / {duration_days} روز*\n"
         "━━━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
     )

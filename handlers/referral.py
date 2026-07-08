@@ -78,10 +78,10 @@ async def cmd_start_referral(message: Message) -> None:
             await message.answer("👋 خوش آمدید! شما قبلاً ثبت‌نام کرده‌اید.")
 
     # نمایش منوی اصلی
-    from keyboards.main_menu import get_main_menu
+    from keyboards.main_menu import get_main_menu, get_main_menu_async
     await message.answer(
         "از منوی زیر گزینه مورد نظر را انتخاب کنید:",
-        reply_markup=get_main_menu(is_admin=db_user.is_admin),
+        reply_markup=await get_main_menu_async(is_admin=db_user.is_admin),
     )
 
 
@@ -89,7 +89,7 @@ async def cmd_start_referral(message: Message) -> None:
 # دکمه «دعوت دوستان»
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "👥 دعوت دوستان")
+@router.message(F.text.contains("دعوت دوستان"))
 @router.callback_query(F.data == "referral_menu")
 async def menu_referral(event: Message | CallbackQuery) -> None:
     """نمایش لینک دعوت + آمار referral کاربر."""

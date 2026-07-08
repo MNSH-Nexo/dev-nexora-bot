@@ -1481,6 +1481,33 @@ _ensure_dns "download.docker.com"
 _ensure_dns "github.com"
 
 _step "Installing base utilities..."
+
+# ── fix dpkg interrupted state (اگه نصب قبلی ناقص مانده) ──────
+if [[ "$PKG_MANAGER" == "apt" ]]; then
+  if apt-get check 2>&1 | grep -qi "dpkg was interrupted\|unmet dep\|broken"; then
+    _warn "dpkg interrupted state detected — fixing..."
+    dpkg --configure -a 2>&1 | tail -3 || true
+    apt-get install -f -y 2>&1 | tail -3 || true
+    _ok "dpkg state fixed"
+  fi
+  # unattended-upgrades را موقتاً متوقف کن تا lock آزاد بشه
+  systemctl stop unattended-upgrades 2>/dev/null || true
+  # صبر برای آزاد شدن apt lock
+  local _w=0
+  while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || \
+        fuser /var/lib/apt/lists/lock      &>/dev/null 2>&1; do
+    sleep 2; (( _w+=2 ))
+    if (( _w >= 60 )); then
+      _warn "apt lock held too long — forcing release..."
+      rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+            /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+      dpkg --configure -a 2>/dev/null || true
+      break
+    fi
+    _progress "Waiting for apt lock... (${_w}s)"
+  done
+fi
+
 _pkgs_apt=(curl git openssl unzip); _pkgs_rpm=(curl git openssl unzip)
 command -v rsync  &>/dev/null || { _pkgs_apt+=(rsync);    _pkgs_rpm+=(rsync); }
 command -v getent &>/dev/null || { _pkgs_apt+=(libc-bin); _pkgs_rpm+=(glibc-common); }

@@ -84,7 +84,7 @@ def _format_ticket(ticket, show_messages: bool = False) -> str:
 # پشتیبانی — منوی اصلی تیکت‌ها
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "❓ پشتیبانی")
+@router.message(F.text.contains("پشتیبانی"))
 @router.callback_query(F.data == "support_list")
 async def menu_support(event: Message | CallbackQuery) -> None:
     """نمایش لیست تیکت‌های کاربر یا دکمه ایجاد تیکت جدید."""

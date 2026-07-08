@@ -26,7 +26,7 @@ from config import settings
 from database import AsyncSessionLocal
 from database.crud import get_or_create_user, get_subscription_by_email
 from database.models import Subscription
-from keyboards.main_menu import get_main_menu
+from keyboards.main_menu import get_main_menu, get_main_menu_async
 from services.xui_api import XUIClient, XUIError
 
 router = Router(name="uuid_import")
@@ -78,7 +78,7 @@ def _xui():
 # ورود — دکمه «🔑 وارد کردن UUID»
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "🔑 وارد کردن UUID")
+@router.message(F.text.contains("وارد کردن UUID"))
 async def msg_uuid_entry(message: Message, state: FSMContext) -> None:
     await state.set_state(UUIDImportStates.waiting_uuid)
     await message.answer(
@@ -109,7 +109,7 @@ async def cb_uuid_entry(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(UUIDImportStates.waiting_uuid, F.text == "/cancel")
 async def uuid_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("❌ لغو شد.", reply_markup=get_main_menu())
+    await message.answer("❌ لغو شد.", reply_markup=await get_main_menu_async())
 
 
 # ──────────────────────────────────────────────

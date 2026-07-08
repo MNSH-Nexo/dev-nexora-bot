@@ -89,6 +89,7 @@ from services.payment_methods import (
    get_payment_status, set_crypto_enabled, set_card_enabled,
    is_crypto_invoice, set_crypto_invoice,
    get_crypto_gateway, set_crypto_gateway,
+   get_price_display_mode, set_price_display_mode,
 )
 
 router = Router(name="admin")
@@ -296,11 +297,11 @@ async def _handle_admin_login(message: Message, provided_pass: str) -> None:
             await session.commit()
             logger.success(f"کاربر جدید {user.id} با دسترسی ادمین ایجاد شد.")
 
-    from keyboards.main_menu import get_main_menu
+    from keyboards.main_menu import get_main_menu, get_main_menu_async
     await message.answer(
         "✅ <b>خوش آمدید ادمین عزیز!</b>\n\nشما وارد حالت مدیریت شدید.",
         parse_mode="HTML",
-        reply_markup=get_main_menu(is_admin=True),
+        reply_markup=await get_main_menu_async(is_admin=True),
     )
     await message.answer(
         "⚙️ <b>پنل مدیریت:</b>",
@@ -343,7 +344,7 @@ async def handle_dynamic_admin_login_if_match(message: Message) -> bool:
 # ⚙️ پنل مدیریت — از منوی اصلی
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "⚙️ پنل مدیریت")
+@router.message(F.text.contains("پنل مدیریت"))
 async def msg_admin_panel(message: Message) -> None:
     if not await _check_admin(message):
         return
@@ -2817,6 +2818,23 @@ def _crypto_api_warning() -> str:
     return ""
 
 
+def _pm_text(pm: dict, warning: str) -> str:
+    """متن صفحه روش‌های پرداخت."""
+    _PRICE_DISPLAY_LABELS = {
+        "both": "هر دو (دلار + تومان)",
+        "usd":  "فقط دلار",
+        "toman": "فقط تومان",
+    }
+    price_mode = _PRICE_DISPLAY_LABELS.get(pm.get("price_display", "both"), "هر دو")
+    return (
+        "💰 <b>روش‌های پرداخت</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"💱 نمایش قیمت پلن‌ها: <b>{price_mode}</b>\n\n"
+        "برای فعال یا غیرفعال کردن هر روش روی آن کلیک کنید:"
+        f"{warning}"
+    )
+
+
 @router.callback_query(F.data == "adm_payment_methods")
 async def cb_adm_payment_methods(callback: CallbackQuery) -> None:
     if not await _check_admin(callback):
@@ -2826,27 +2844,24 @@ async def cb_adm_payment_methods(callback: CallbackQuery) -> None:
     warning = _crypto_api_warning() if pm["crypto"] else ""
     try:
         await callback.message.edit_text(
-            "💰 <b>روش‌های پرداخت</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            "برای فعال یا غیرفعال کردن هر روش روی آن کلیک کنید:"
-            f"{warning}",
+            _pm_text(pm, warning),
             parse_mode="HTML",
             reply_markup=get_payment_methods_keyboard(
                 crypto_on=pm["crypto"], card_on=pm["card"],
                 crypto_invoice=pm.get("crypto_invoice", False),
                 crypto_gateway=pm.get("crypto_gateway", "nowpayments"),
+                price_display=pm.get("price_display", "both"),
             ),
         )
     except Exception:
         await callback.message.answer(
-            "💰 <b>روش‌های پرداخت</b>\n━━━━━━━━━━━━━━━\n"
-            "برای فعال یا غیرفعال کردن هر روش روی آن کلیک کنید:"
-            f"{warning}",
+            _pm_text(pm, warning),
             parse_mode="HTML",
             reply_markup=get_payment_methods_keyboard(
                 crypto_on=pm["crypto"], card_on=pm["card"],
                 crypto_invoice=pm.get("crypto_invoice", False),
                 crypto_gateway=pm.get("crypto_gateway", "nowpayments"),
+                price_display=pm.get("price_display", "both"),
             ),
         )
 
@@ -2855,7 +2870,7 @@ async def cb_adm_payment_methods(callback: CallbackQuery) -> None:
 async def cb_adm_pm_toggle(callback: CallbackQuery) -> None:
     if not await _check_admin(callback):
         return
-    method = callback.data.split(":")[1]  # crypto | card | crypto_invoice | crypto_gateway
+    method = callback.data.split(":")[1]  # crypto | card | crypto_invoice | crypto_gateway | price_display
     pm = await get_payment_status()
 
     if method == "crypto":
@@ -2873,8 +2888,17 @@ async def cb_adm_pm_toggle(callback: CallbackQuery) -> None:
         current_gw = pm.get("crypto_gateway", "nowpayments")
         new_gw = "maxelpay" if current_gw == "nowpayments" else "nowpayments"
         await set_crypto_gateway(new_gw)
-        label = f"درگاه کریپتو"
-        status_text = f"💜 MaxelPay" if new_gw == "maxelpay" else "🔵 NOWPayments"
+        label = "درگاه کریپتو"
+        status_text = "💜 MaxelPay" if new_gw == "maxelpay" else "🔵 NOWPayments"
+    elif method == "price_display":
+        # چرخش بین three حالت: both → usd → toman → both
+        _CYCLE = {"both": "usd", "usd": "toman", "toman": "both"}
+        current_mode = pm.get("price_display", "both")
+        new_mode = _CYCLE.get(current_mode, "both")
+        await set_price_display_mode(new_mode)
+        _MODE_LABELS = {"both": "هر دو", "usd": "فقط دلار", "toman": "فقط تومان"}
+        label = "نمایش قیمت"
+        status_text = _MODE_LABELS.get(new_mode, new_mode)
     else:
         new_val = not pm["card"]
         await set_card_enabled(new_val)
@@ -2886,18 +2910,19 @@ async def cb_adm_pm_toggle(callback: CallbackQuery) -> None:
     # رفرش صفحه
     pm = await get_payment_status()
     warning = _crypto_api_warning() if pm["crypto"] else ""
-    await callback.message.edit_text(
-        "💰 <b>روش‌های پرداخت</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        "برای فعال یا غیرفعال کردن هر روش روی آن کلیک کنید:"
-        f"{warning}",
-        parse_mode="HTML",
-        reply_markup=get_payment_methods_keyboard(
-            crypto_on=pm["crypto"], card_on=pm["card"],
-            crypto_invoice=pm.get("crypto_invoice", False),
-            crypto_gateway=pm.get("crypto_gateway", "nowpayments"),
-        ),
-    )
+    try:
+        await callback.message.edit_text(
+            _pm_text(pm, warning),
+            parse_mode="HTML",
+            reply_markup=get_payment_methods_keyboard(
+                crypto_on=pm["crypto"], card_on=pm["card"],
+                crypto_invoice=pm.get("crypto_invoice", False),
+                crypto_gateway=pm.get("crypto_gateway", "nowpayments"),
+                price_display=pm.get("price_display", "both"),
+            ),
+        )
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -3771,14 +3796,16 @@ class TestSubEditStates(StatesGroup):
     waiting_value = State()
 
 
-def _get_test_sub_keyboard(enabled: bool, traffic: int, days: int):
+def _get_test_sub_keyboard(enabled: bool, traffic: float, days: int):
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     toggle_text = "🔴 غیرفعال کردن تست" if enabled else "✅ فعال کردن تست"
-    kb.button(text=toggle_text,              callback_data="adm_test_toggle")
-    kb.button(text=f"📦 حجم: {traffic} GB", callback_data="adm_test_edit:traffic")
-    kb.button(text=f"⏱ مدت: {days} روز",   callback_data="adm_test_edit:days")
-    kb.button(text="🔙 بازگشت",             callback_data="adm_back")
+    # نمایش حجم: اگه زیر 1 GB بود به MB تبدیل کن
+    traffic_label = f"{traffic:g} GB" if traffic >= 1 else f"{traffic * 1024:.0f} MB"
+    kb.button(text=toggle_text,                        callback_data="adm_test_toggle")
+    kb.button(text=f"📦 حجم: {traffic_label}",         callback_data="adm_test_edit:traffic")
+    kb.button(text=f"⏱ مدت: {days} روز",              callback_data="adm_test_edit:days")
+    kb.button(text="🔙 بازگشت",                        callback_data="adm_back")
     kb.adjust(1, 2, 1)
     return kb.as_markup()
 
@@ -3794,18 +3821,27 @@ async def _show_test_sub_settings(target: CallbackQuery) -> None:
                                         str(settings.test_duration_days))
 
     enabled = enabled_raw.lower() == "true"
-    traffic = int(traffic_raw) if traffic_raw.isdigit() else settings.test_traffic_gb
-    days    = int(days_raw)    if days_raw.isdigit()    else settings.test_duration_days
+    try:
+        traffic = float(traffic_raw) if traffic_raw else float(settings.test_traffic_gb)
+    except (ValueError, TypeError):
+        traffic = float(settings.test_traffic_gb)
+    try:
+        days = int(days_raw) if days_raw.isdigit() else settings.test_duration_days
+    except (ValueError, TypeError):
+        days = settings.test_duration_days
 
+    # نمایش حجم: اگر زیر 1 GB بود به MB تبدیل کن
+    traffic_label = f"{traffic:g} GB" if traffic >= 1 else f"{traffic * 1024:.0f} MB"
     status_icon = "✅ فعال" if enabled else "🔴 غیرفعال"
     text = (
         "🎁 <b>تنظیمات اشتراک تست رایگان</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"وضعیت: <b>{status_icon}</b>\n"
-        f"📦 حجم: <b>{traffic} GB</b>\n"
+        f"📦 حجم: <b>{traffic_label}</b>\n"
         f"⏱ مدت: <b>{days} روز</b>\n\n"
         "• هر کاربر فقط یک‌بار می‌تواند از اشتراک تست استفاده کند.\n"
-        "• برای تغییر حجم یا مدت، روی دکمه مربوطه کلیک کنید."
+        "• برای تغییر حجم یا مدت، روی دکمه مربوطه کلیک کنید.\n"
+        "• برای حجم زیر ۱ گیگابایت، عدد اعشاری وارد کنید مثلاً: <code>0.05</code> = 50 MB"
     )
     try:
         await target.message.edit_text(
@@ -3851,7 +3887,12 @@ async def cb_adm_test_edit(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     field = callback.data.split(":")[1]
     if field == "traffic":
-        prompt = "📦 حجم جدید اشتراک تست را به <b>GB</b> وارد کنید:\nمثال: <code>1</code>"
+        prompt = (
+            "📦 حجم جدید اشتراک تست را به <b>GB</b> وارد کنید:\n"
+            "• عدد صحیح: <code>1</code> = 1 گیگابایت\n"
+            "• عدد اعشاری: <code>0.05</code> = 50 مگابایت\n"
+            "• <code>0.5</code> = 500 مگابایت"
+        )
     else:
         prompt = "⏱ مدت جدید اشتراک تست را به <b>روز</b> وارد کنید:\nمثال: <code>1</code>"
     await state.set_state(TestSubEditStates.waiting_value)
@@ -3866,20 +3907,95 @@ async def msg_test_sub_edit_value(message: Message, state: FSMContext) -> None:
         return
     data  = await state.get_data()
     field = data.get("field", "")
-    val   = (message.text or "").strip()
-
-    if not val.isdigit() or int(val) < 1:
-        await message.answer("❌ لطفاً یک عدد مثبت وارد کنید.")
-        return
+    val   = (message.text or "").strip().replace(",", ".")
 
     from database.crud import set_setting
-    async with AsyncSessionLocal() as session:
-        if field == "traffic":
-            await set_setting(session, "test_sub_traffic_gb", val)
-            label = f"📦 حجم اشتراک تست به <b>{val} GB</b> تغییر کرد."
-        else:
+
+    if field == "traffic":
+        # پشتیبانی از اعداد اعشاری برای حجم (مثلاً 0.05 = 50 MB)
+        try:
+            traffic_val = float(val)
+            if traffic_val <= 0:
+                raise ValueError("باید مثبت باشد")
+        except (ValueError, TypeError):
+            await message.answer(
+                "❌ لطفاً یک عدد مثبت وارد کنید.\n"
+                "مثال: <code>1</code> یا <code>0.05</code>",
+                parse_mode="HTML",
+            )
+            return
+        async with AsyncSessionLocal() as session:
+            await set_setting(session, "test_sub_traffic_gb", str(traffic_val))
+        traffic_label = f"{traffic_val:g} GB" if traffic_val >= 1 else f"{traffic_val * 1024:.0f} MB"
+        label = f"📦 حجم اشتراک تست به <b>{traffic_label}</b> تغییر کرد."
+    else:
+        # مدت فقط عدد صحیح قبول می‌کند
+        if not val.isdigit() or int(val) < 1:
+            await message.answer("❌ لطفاً یک عدد صحیح مثبت وارد کنید.")
+            return
+        async with AsyncSessionLocal() as session:
             await set_setting(session, "test_sub_duration_days", val)
-            label = f"⏱ مدت اشتراک تست به <b>{val} روز</b> تغییر کرد."
+        label = f"⏱ مدت اشتراک تست به <b>{val} روز</b> تغییر کرد."
 
     await state.clear()
     await message.answer(f"✅ {label}", parse_mode="HTML")
+
+
+# ──────────────────────────────────────────────
+# 🎨 مدیریت تم ربات
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "adm_theme")
+async def cb_adm_theme(callback: CallbackQuery) -> None:
+    """نمایش صفحه انتخاب تم ربات."""
+    if not await _check_admin(callback):
+        return
+    await callback.answer()
+    from services.theme import get_current_theme, THEMES
+    from keyboards.admin import get_theme_keyboard
+    t = await get_current_theme()
+    text = (
+        "🎨 <b>تم ربات</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"تم فعلی: <b>{t.label}</b>\n\n"
+        "• <b>✦ Moonstone</b> — طلایی گرم، ظریف و لوکس (پیش‌فرض)\n"
+        "• <b>✦ Rose Ember</b> — قرمز گرم، شیک و جذاب\n\n"
+        "روی تم مورد نظر کلیک کنید تا فوری اعمال شود:"
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML",
+                                         reply_markup=get_theme_keyboard(t.name))
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML",
+                                      reply_markup=get_theme_keyboard(t.name))
+
+
+@router.callback_query(F.data.startswith("adm_theme_set:"))
+async def cb_adm_theme_set(callback: CallbackQuery) -> None:
+    """اعمال تم انتخاب‌شده."""
+    if not await _check_admin(callback):
+        return
+    theme_name = callback.data.split(":")[1]
+    from services.theme import set_theme, get_current_theme, THEMES
+    from keyboards.admin import get_theme_keyboard
+    if theme_name not in THEMES:
+        await callback.answer("❌ تم نامعتبر!", show_alert=True)
+        return
+    await set_theme(theme_name)
+    t = THEMES[theme_name]
+    await callback.answer(f"✅ تم به «{t.label}» تغییر کرد!", show_alert=True)
+    # رفرش صفحه
+    current = await get_current_theme()
+    text = (
+        "🎨 <b>تم ربات</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"تم فعلی: <b>{current.label}</b>\n\n"
+        "• <b>✦ Moonstone</b> — طلایی گرم، ظریف و لوکس (پیش‌فرض)\n"
+        "• <b>✦ Rose Ember</b> — قرمز گرم، شیک و جذاب\n\n"
+        "روی تم مورد نظر کلیک کنید تا فوری اعمال شود:"
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML",
+                                         reply_markup=get_theme_keyboard(current.name))
+    except Exception:
+        pass

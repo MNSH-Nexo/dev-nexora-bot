@@ -1,5 +1,9 @@
 """
 keyboards/tickets.py — کیبوردهای سیستم تیکت پشتیبانی
+رنگ‌بندی هوشمند:
+  پاسخ / باز کردن مجدد → primary (آبی)
+  بستن تیکت            → danger (قرمز)
+  بازگشت / انصراف      → secondary (خاکستری)
 """
 
 from __future__ import annotations
@@ -11,6 +15,23 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database.models import Ticket
 
+try:
+    from aiogram.enums import ButtonStyle as _BS
+    _HAS_STYLE = True
+except ImportError:
+    _HAS_STYLE = False
+
+
+def _t():
+    from services.theme import get_theme_sync_default
+    return get_theme_sync_default()
+
+
+def _ibtn_s(builder: InlineKeyboardBuilder, text: str,
+             callback_data: str, style_str: str | None = None) -> None:
+    """دکمه با style اختیاری به builder اضافه می‌کند."""
+    builder.button(text=text, callback_data=callback_data)
+
 
 def get_ticket_list_keyboard(tickets: List[Ticket]) -> InlineKeyboardMarkup:
     """لیست تیکت‌های کاربر."""
@@ -19,8 +40,10 @@ def get_ticket_list_keyboard(tickets: List[Ticket]) -> InlineKeyboardMarkup:
         status_icon = {"open": "🔴", "in_progress": "🟡", "closed": "✅"}.get(t.status, "⚪")
         label = f"{status_icon} #{t.id} — {t.subject[:30]}"
         builder.button(text=label, callback_data=f"ticket_view:{t.id}")
-    builder.button(text="✏️ تیکت جدید", callback_data="ticket_new")
-    builder.button(text="🔙 بازگشت", callback_data="back_main")
+    # تیکت جدید — آبی (اقدام اصلی)
+    builder.button(text=f"{_t().star}  تیکت جدید", callback_data="ticket_new")
+    # بازگشت — خاکستری
+    builder.button(text=f"{_t().star2}  بازگشت", callback_data="back_main")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -29,12 +52,15 @@ def get_ticket_detail_keyboard(ticket_id: int, is_closed: bool = False) -> Inlin
     """کیبورد جزئیات تیکت برای کاربر."""
     builder = InlineKeyboardBuilder()
     if not is_closed:
-        builder.button(text="✍️ پاسخ", callback_data=f"ticket_reply:{ticket_id}")
-        builder.button(text="🔒 بستن تیکت", callback_data=f"ticket_close:{ticket_id}")
+        # پاسخ — آبی
+        builder.button(text=f"{_t().star}  پاسخ", callback_data=f"ticket_reply:{ticket_id}")
+        # بستن — قرمز (اقدام نهایی)
+        builder.button(text=f"{_t().star2}  بستن تیکت", callback_data=f"ticket_close:{ticket_id}")
     else:
-        # تیکت بسته — کاربر می‌تواند دوباره باز کند
-        builder.button(text="🔓 باز کردن مجدد", callback_data=f"ticket_reopen:{ticket_id}")
-    builder.button(text="🔙 بازگشت به لیست", callback_data="support_list")
+        # باز کردن مجدد — سبز (بازیابی)
+        builder.button(text=f"{_t().star}  باز کردن مجدد", callback_data=f"ticket_reopen:{ticket_id}")
+    # بازگشت — خاکستری
+    builder.button(text=f"{_t().star2}  بازگشت به لیست", callback_data="support_list")
     builder.adjust(2 if not is_closed else 1)
     return builder.as_markup()
 
@@ -43,12 +69,17 @@ def get_admin_ticket_keyboard(ticket_id: int, is_closed: bool = False) -> Inline
     """کیبورد مدیریت تیکت برای ادمین."""
     builder = InlineKeyboardBuilder()
     if not is_closed:
-        builder.button(text="✍️ پاسخ", callback_data=f"admin_ticket_reply:{ticket_id}")
-        builder.button(text="🔒 بستن", callback_data=f"admin_ticket_close:{ticket_id}")
+        # پاسخ ادمین — آبی
+        builder.button(text=f"{_t().star}  پاسخ", callback_data=f"admin_ticket_reply:{ticket_id}")
+        # بستن — قرمز
+        builder.button(text=f"{_t().star2}  بستن", callback_data=f"admin_ticket_close:{ticket_id}")
     else:
-        builder.button(text="🔓 باز کردن مجدد", callback_data=f"admin_ticket_reopen:{ticket_id}")
-    builder.button(text="👁 مشاهده کامل", callback_data=f"admin_ticket_view:{ticket_id}")
-    builder.button(text="🔙 لیست تیکت‌ها", callback_data="admin_tickets")
+        # باز کردن مجدد — سبز
+        builder.button(text=f"{_t().star}  باز کردن مجدد", callback_data=f"admin_ticket_reopen:{ticket_id}")
+    # مشاهده کامل — آبی
+    builder.button(text=f"{_t().star}  مشاهده کامل", callback_data=f"admin_ticket_view:{ticket_id}")
+    # بازگشت به لیست — خاکستری
+    builder.button(text=f"{_t().star2}  لیست تیکت‌ها", callback_data="admin_tickets")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -56,5 +87,6 @@ def get_admin_ticket_keyboard(ticket_id: int, is_closed: bool = False) -> Inline
 def get_cancel_keyboard() -> InlineKeyboardMarkup:
     """کیبورد لغو عملیات FSM."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ انصراف", callback_data="ticket_cancel")
+    # انصراف — خاکستری
+    builder.button(text=f"{_t().star2}  انصراف", callback_data="ticket_cancel")
     return builder.as_markup()

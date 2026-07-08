@@ -18,7 +18,7 @@ from loguru import logger
 
 from config import settings
 from database import AsyncSessionLocal, get_or_create_user, get_user_by_telegram_id
-from keyboards.main_menu import get_main_menu
+from keyboards.main_menu import get_main_menu, get_main_menu_async
 from services.banner import send_with_banner
 from services.welcome import (
     check_user_joined,
@@ -144,18 +144,17 @@ async def cmd_start(message: Message) -> None:
 
 async def _show_main_menu(target: Message, db_user) -> None:
     """نمایش منوی اصلی به کاربر."""
+    from services.theme import get_current_theme as _get_t
+    _th = await _get_t()
     user = target.from_user
     name = (user.first_name if user else None) or (user.username if user else None) or "کاربر"
-    greeting = "🌟 به ربات خوش آمدید" if True else "👋 سلام"
-    # اگر کاربر قبلاً /start زده بود greeting متفاوت نمی‌خواهیم
     text = (
-        f"👋 سلام <b>{name}</b>!\n"
-        "━━━━━━━━━━━━━━━\n"
-        "🔐 <b>ربات فروش اشتراک VPN</b>\n\n"
-        "با این ربات می‌توانید:\n"
-        "• اشتراک VPN بخرید\n"
-        "• وضعیت اشتراک خود را ببینید\n"
-        "• با پشتیبانی در تماس باشید\n\n"
+        f"{_th.header_icon} سلام <b>{name}</b>!\n"
+        f"{_th.sep}\n"
+        f"🔐 <b>ربات فروش اشتراک VPN</b>\n\n"
+        f"{_th.bullet} اشتراک VPN بخرید\n"
+        f"{_th.bullet} وضعیت اشتراک خود را ببینید\n"
+        f"{_th.bullet} با پشتیبانی در تماس باشید\n\n"
         "👇 از منوی زیر انتخاب کنید:"
     )
     try:
@@ -163,13 +162,13 @@ async def _show_main_menu(target: Message, db_user) -> None:
             target,
             text,
             parse_mode="HTML",
-            reply_markup=get_main_menu(is_admin=db_user.is_admin),
+            reply_markup=await get_main_menu_async(is_admin=db_user.is_admin),
         )
     except Exception:
         await target.answer(
             text,
             parse_mode="HTML",
-            reply_markup=get_main_menu(is_admin=db_user.is_admin),
+            reply_markup=await get_main_menu_async(is_admin=db_user.is_admin),
         )
 
 
@@ -225,7 +224,7 @@ async def cb_check_join(callback: CallbackQuery) -> None:
 # منوی خرید کانفیگ (دکمه Reply)
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "🛒 خرید کانفیگ")
+@router.message(F.text.contains("خرید کانفیگ"))
 async def menu_buy_config(message: Message) -> None:
     """دریافت لیست پلن‌ها از پنل و نمایش به کاربر."""
     await message.answer("⏳ در حال دریافت پلن‌ها از سرور...")
@@ -379,16 +378,15 @@ async def cb_confirm_buy_legacy(callback: CallbackQuery) -> None:
 
 
 # ──────────────────────────────────────────────
-# منوی اشتراک‌های من
+# منوی اشتراک‌های من — نمایش لیست
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "📊 اشتراک‌های من")
+@router.message(F.text.contains("اشتراک‌های من"))
 @router.callback_query(F.data == "my_subs")
 async def menu_my_subscriptions(event: Message | CallbackQuery) -> None:
     """
-    نمایش اشتراک‌ها:
-    - هر اشتراک = یک پیام: اطلاعات + QR (کپشن) + دکمه «دریافت کانفیگ‌ها»
-    - کانفیگ‌ها روی دکمه جداگانه — همه در یک پیام
+    نمایش لیست اشتراک‌ها با دکمه برای هر کدام.
+    کاربر روی هر اشتراک کلیک می‌کند تا جزئیات + QR آن را ببیند.
     """
     if isinstance(event, CallbackQuery):
         await event.answer()
@@ -422,87 +420,156 @@ async def menu_my_subscriptions(event: Message | CallbackQuery) -> None:
         "pending": "⏳ در انتظار",
     }
 
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    # نمایش لیست اشتراک‌ها با دکمه برای هر کدام
+    from services.theme import get_current_theme as _get_theme
+    _th = await _get_theme()
+    text = f"{_th.header_icon} <b>اشتراک‌های شما</b>\n{_th.sep}\nبرای مشاهده جزئیات، روی هر اشتراک کلیک کنید:\n"
+    b = InlineKeyboardBuilder()
+    for i, sub in enumerate(subs, 1):
+        status_fa = _STATUS_FA.get(sub.status, sub.status)
+        b.button(
+            text=f"{_th.star}  اشتراک {i} — {sub.email}  {status_fa}",
+            callback_data=f"sub_detail:{sub.id}",
+        )
+    b.adjust(1)
+    await target_msg.answer(text, parse_mode="HTML", reply_markup=b.as_markup())
+
+
+# ──────────────────────────────────────────────
+# Callback: sub_detail:{sub_id} — نمایش جزئیات یک اشتراک
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("sub_detail:"))
+async def cb_sub_detail(callback: CallbackQuery) -> None:
+    """
+    نمایش جزئیات + QR اشتراک با ترافیک بروز از پنل.
+    """
+    await callback.answer("⏳ در حال بروزرسانی...")
+    sub_id = int(callback.data.split(":")[1])
+
+    from database.models import Subscription as _Sub
+    from sqlalchemy import select as sa_select
+    from database.crud import update_subscription_traffic
+
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(sa_select(_Sub).where(_Sub.id == sub_id))
+        sub = res.scalar_one_or_none()
+
+    if not sub:
+        await callback.message.answer("❌ اشتراک پیدا نشد!")  # type: ignore[union-attr]
+        return
+
+    # ── بروزرسانی ترافیک از پنل ───────────────────────────
+    try:
+        async with XUIClient(
+            panel_url=settings.panel_url,
+            username=settings.panel_username,
+            password=settings.panel_password,
+            api_path=settings.panel_api_path,
+            sub_port=settings.sub_port,
+        ) as xui:
+            traffic_info = await xui.get_client_traffic(sub.email)
+            if traffic_info:
+                # traffic_info یک ClientInfo object است — up و down به بایت
+                used_bytes = (traffic_info.up or 0) + (traffic_info.down or 0)
+                async with AsyncSessionLocal() as sess2:
+                    await update_subscription_traffic(sess2, sub_id, used_bytes)
+                # مقدار بروز را روی object اعمال کن
+                sub.used_traffic_bytes = used_bytes
+    except Exception as e:
+        logger.warning(f"بروزرسانی ترافیک اشتراک {sub.email} ناموفق: {e}")
+
+    _STATUS_FA = {
+        "active": "✅ فعال", "expired": "⏰ منقضی",
+        "depleted": "📭 تمام‌شده", "disabled": "🚫 غیرفعال",
+        "pending": "⏳ در انتظار",
+    }
+
     from config import settings as _s
     from services.xui_api import build_sub_link_for
     from utils.qrcode_gen import generate_qr_code
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-    for i, sub in enumerate(subs, 1):
-        used_gb   = sub.used_traffic_bytes / 1024 ** 3
-        limit_gb  = sub.traffic_limit_gb or 0
-        expire    = _fmt_expiry(sub.expiry_date)
-        status_fa = _STATUS_FA.get(sub.status, sub.status)
-        sub_link  = build_sub_link_for(_s.panel_url, sub.sub_id, _s.sub_port)
+    used_gb   = sub.used_traffic_bytes / 1024 ** 3
+    limit_gb  = sub.traffic_limit_gb or 0
+    expire    = _fmt_expiry(sub.expiry_date)
+    status_fa = _STATUS_FA.get(sub.status, sub.status)
+    sub_link  = build_sub_link_for(_s.panel_url, sub.sub_id, _s.sub_port)
 
-        # ── ترافیک: نوار پیشرفت + درصد ─────────────────────────
-        if limit_gb and limit_gb > 0:
-            pct = min(used_gb / limit_gb * 100, 100)
-            # نوار ۱۰ کاراکتری
-            filled  = int(pct / 10)
-            bar     = "█" * filled + "░" * (10 - filled)
-            limit_label   = f"{limit_gb} GB"
-            traffic_line  = (
-                f"📊 ترافیک: <code>{used_gb:.2f}</code> / <code>{limit_label}</code>\n"
-                f"   [{bar}] <code>{pct:.0f}%</code> مصرف شده\n"
-            )
-        else:
-            traffic_line = f"📊 ترافیک: <code>{used_gb:.2f} GB</code> مصرف — <b>نامحدود</b>\n"
-
-        # ── محدودیت دستگاه همزمان ────────────────────────────────
-        ip_limit_val = getattr(sub, "limit_ip", 0) or 0
-        if ip_limit_val and ip_limit_val > 0:
-            ip_line = f"📱 دستگاه مجاز: <b>{ip_limit_val} دستگاه همزمان</b>\n"
-        else:
-            ip_line = f"📱 دستگاه مجاز: <b>نامحدود</b>\n"
-
-        # ── وضعیت انقضا با هشدار ─────────────────────────────────
-        expire_warn = ""
-        if sub.expiry_date:
-            from datetime import datetime as _dt, timezone as _tz
-            expiry_aware = sub.expiry_date
-            if expiry_aware.tzinfo is None:
-                expiry_aware = expiry_aware.replace(tzinfo=_tz.utc)
-            remaining = expiry_aware - _dt.now(_tz.utc)
-            days_left = remaining.days
-            if days_left <= 3 and sub.status == "active":
-                expire_warn = f"   ⚠️ <b>{days_left} روز تا انقضا!</b>\n"
-            elif days_left <= 7 and sub.status == "active":
-                expire_warn = f"   ⏰ {days_left} روز باقی مانده\n"
-
-        # ── کپشن کامل ────────────────────────────────────────────
-        caption = (
-            f"📦 <b>اشتراک {i}</b>  {status_fa}\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📧 شناسه: <code>{sub.email}</code>\n"
-            f"{traffic_line}"
-            f"⏳ انقضا: <code>{expire}</code>\n"
-            f"{expire_warn}"
-            f"{ip_line}"
-            f"\n🔗 <b>لینک اشتراک:</b>\n"
-            f"<code>{sub_link}</code>"
+    # ── ترافیک: نوار پیشرفت + درصد ─────────────────────────
+    if limit_gb and limit_gb > 0:
+        pct = min(used_gb / limit_gb * 100, 100)
+        filled  = int(pct / 10)
+        bar     = "█" * filled + "░" * (10 - filled)
+        limit_label   = f"{limit_gb} GB"
+        traffic_line  = (
+            f"📊 ترافیک: <code>{used_gb:.2f}</code> / <code>{limit_label}</code>\n"
+            f"   [{bar}] <code>{pct:.0f}%</code> مصرف شده\n"
         )
+    else:
+        traffic_line = f"📊 ترافیک: <code>{used_gb:.2f} GB</code> مصرف — <b>نامحدود</b>\n"
 
-        # دکمه دریافت کانفیگ
-        b = InlineKeyboardBuilder()
-        b.button(text="📋 دریافت کانفیگ‌های مستقل", callback_data=f"get_configs:{sub.id}")
-        kb = b.as_markup()
+    # ── محدودیت دستگاه همزمان ────────────────────────────────
+    ip_limit_val = getattr(sub, "limit_ip", 0) or 0
+    if ip_limit_val and ip_limit_val > 0:
+        ip_line = f"📱 دستگاه مجاز: <b>{ip_limit_val} دستگاه همزمان</b>\n"
+    else:
+        ip_line = f"📱 دستگاه مجاز: <b>نامحدود</b>\n"
 
-        # ارسال QR + کپشن در یک پیام
-        try:
-            qr_bytes = await generate_qr_code(sub_link)
-            if qr_bytes:
-                await target_msg.answer_photo(
-                    BufferedInputFile(qr_bytes, filename=f"sub_{i}_qr.png"),
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                )
-                continue
-        except Exception as e:
-            logger.warning(f"خطا در QR اشتراک {sub.email}: {e}")
+    # ── وضعیت انقضا با هشدار ─────────────────────────────────
+    expire_warn = ""
+    if sub.expiry_date:
+        from datetime import datetime as _dt, timezone as _tz
+        expiry_aware = sub.expiry_date
+        if expiry_aware.tzinfo is None:
+            expiry_aware = expiry_aware.replace(tzinfo=_tz.utc)
+        remaining = expiry_aware - _dt.now(_tz.utc)
+        days_left = remaining.days
+        if days_left <= 3 and sub.status == "active":
+            expire_warn = f"   ⚠️ <b>{days_left} روز تا انقضا!</b>\n"
+        elif days_left <= 7 and sub.status == "active":
+            expire_warn = f"   ⏰ {days_left} روز باقی مانده\n"
 
-        # fallback بدون QR
-        await target_msg.answer(caption, parse_mode="HTML", reply_markup=kb)
+    # ── کپشن کامل ────────────────────────────────────────────
+    caption = (
+        f"📦 <b>{sub.email}</b>  {status_fa}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📧 شناسه: <code>{sub.email}</code>\n"
+        f"{traffic_line}"
+        f"⏳ انقضا: <code>{expire}</code>\n"
+        f"{expire_warn}"
+        f"{ip_line}"
+        f"\n🔗 <b>لینک اشتراک:</b>\n"
+        f"<code>{sub_link}</code>"
+    )
+
+    # دکمه‌های جزئیات
+    b = InlineKeyboardBuilder()
+    from services.theme import get_theme_sync_default as _gts
+    _th2 = _gts()
+    b.button(text=f"{_th2.star}  دریافت کانفیگ‌های مستقل", callback_data=f"get_configs:{sub.id}")
+    b.button(text=f"{_th2.star2}  بازگشت به لیست", callback_data="my_subs")
+    b.adjust(1)
+    kb = b.as_markup()
+
+    # ارسال QR + کپشن در یک پیام
+    try:
+        qr_bytes = await generate_qr_code(sub_link)
+        if qr_bytes:
+            await callback.message.answer_photo(  # type: ignore[union-attr]
+                BufferedInputFile(qr_bytes, filename=f"sub_qr.png"),
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            return
+    except Exception as e:
+        logger.warning(f"خطا در QR اشتراک {sub.email}: {e}")
+
+    # fallback بدون QR
+    await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)  # type: ignore[union-attr]
 
 
 async def _fetch_sub_links_direct(sub_id_str: str) -> list[str]:
@@ -696,7 +763,7 @@ async def cb_get_configs(callback: CallbackQuery) -> None:
 # منوی پروفایل
 # ──────────────────────────────────────────────
 
-@router.message(F.text == "👤 پروفایل")
+@router.message(F.text.contains("پروفایل"))
 async def menu_profile(message: Message) -> None:
     """نمایش اطلاعات پروفایل کاربر."""
     tg_user = message.from_user
@@ -767,6 +834,6 @@ async def cb_back_main(callback: CallbackQuery) -> None:
 
     await callback.message.answer(  # type: ignore[union-attr]
         "🏠 منوی اصلی:",
-        reply_markup=get_main_menu(is_admin=is_admin),
+        reply_markup=await get_main_menu_async(is_admin=is_admin),
     )
     await callback.message.delete()  # type: ignore[union-attr]

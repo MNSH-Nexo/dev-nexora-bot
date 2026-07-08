@@ -108,7 +108,7 @@ async def create_new_subscription(
     user_id: int,
     telegram_id: int,
     inbound_id: int,
-    traffic_gb: int = 0,
+    traffic_gb: float = 0,
     expire_days: int = 0,
     is_gift: bool = False,
     plan_id: int = 0,
@@ -166,6 +166,7 @@ async def create_new_subscription(
     #   3. اینباندهای فعال عمومی (adm_inbounds)
     #   4. fallback: اینباند 1
     enabled_ids = await get_enabled_inbound_ids(session)
+    logger.debug(f"اینباندهای فعال در DB: {enabled_ids}")
 
     if inbound_id != 0:
         # اگه صریحاً یه اینباند داده شده، فقط همون
@@ -185,8 +186,15 @@ async def create_new_subscription(
         elif enabled_ids:
             # اینباندهای فعال عمومی
             target_inbound_ids = enabled_ids
+            logger.info(f"اینباندهای فعال عمومی: {target_inbound_ids}")
         else:
             # fallback: اینباند 1
+            # هشدار: اگه ادمین هیچ اینباندی فعال نکرده، این ممکنه خطا بده
+            logger.warning(
+                "⚠️ هیچ اینباندی در تنظیمات ربات فعال نشده! "
+                "از پنل ادمین → اینباند تست → اینباند مورد نظر را فعال کنید. "
+                "Fallback: اینباند 1"
+            )
             target_inbound_ids = [1]
 
     # ── خواندن limit_ip از پلن ──────────────────────────────
@@ -231,6 +239,9 @@ async def create_new_subscription(
         MAX_RETRY = 10
         client_info = None
         email = ""
+        # traffic_gb را به int تبدیل کن (پنل int می‌خواد)
+        traffic_gb_int = int(traffic_gb) if traffic_gb > 0 else 0
+
         for attempt in range(MAX_RETRY):
             email = await _next_email(session, is_gift=is_gift)
             logger.info(f"ایجاد اشتراک: user_id={user_id}, inbounds={target_inbound_ids}, email={email} (تلاش {attempt+1})")
@@ -238,7 +249,7 @@ async def create_new_subscription(
                 client_info = await xui.add_client(
                     inbound_id=first_inbound_id,
                     email=email,
-                    traffic_gb=traffic_gb,
+                    traffic_gb=traffic_gb_int,
                     expire_days=expire_days,
                     tg_id=telegram_id,
                     limit_ip=plan_limit_ip,
@@ -246,10 +257,12 @@ async def create_new_subscription(
                 break  # موفق شد
             except XUIError as e:
                 err_str = str(e).lower()
-                if "already in use" in err_str or "email" in err_str:
+                # فقط خطاهای صریح "email تکراری" رو retry کن
+                # نه هر خطایی که کلمه "email" داره
+                if "already in use" in err_str or "duplicate" in err_str or "exists" in err_str:
                     logger.warning(f"email '{email}' تکراری است، تلاش بعدی...")
                     continue  # ایمیل بعدی را امتحان کن
-                raise  # خطای دیگری است، رای داده بشه
+                raise  # خطای دیگری است، raise کن
 
         if client_info is None:
             raise XUIError(f"پس از {MAX_RETRY} تلاش نتوانستیم email آزادی پیدا کنیم.")
@@ -263,7 +276,7 @@ async def create_new_subscription(
                 await xui.add_client(
                     inbound_id=extra_iid,
                     email=email,
-                    traffic_gb=traffic_gb,
+                    traffic_gb=traffic_gb_int,
                     expire_days=expire_days,
                     tg_id=telegram_id,
                     sub_id=client_info.sub_id,  # همون sub_id تا sub_link یکی باشه
