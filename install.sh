@@ -739,6 +739,113 @@ XUIEOF
 }
 
 # ══════════════════════════════════════════════════════════════
+#  botdb.ts patcher
+#  جایگزینی static import با require() برای جلوگیری از module crash
+# ══════════════════════════════════════════════════════════════
+_patch_botdb_ts() {
+  local _target="$1"
+  cat > "$_target" <<'BOTDBEOF'
+/**
+ * lib/botdb.ts — v2 (VPS-patched by installer)
+ * تغییر: require() به جای static import — اگه better-sqlite3 load نشه،
+ * فقط getBotDb null برمی‌گرده (و error لاگ می‌شه) به جای کرش کل module.
+ */
+import fs from "fs";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _Sqlite: any = null;
+let _sqliteErr: string | null = null;
+
+function getSqlite() {
+  if (_Sqlite !== null) return _Sqlite;
+  if (_sqliteErr !== null) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    _Sqlite = require("better-sqlite3");
+    return _Sqlite;
+  } catch (e) {
+    _sqliteErr = String(e);
+    console.error("[botdb] better-sqlite3 failed to load:", _sqliteErr);
+    return null;
+  }
+}
+getSqlite(); // warm-up at module load
+
+function getDbCandidates(): string[] {
+  const candidates: string[] = [];
+  const envPath = process.env.BOT_DB_PATH?.trim();
+  if (envPath) candidates.push(envPath);
+  candidates.push("/var/lib/docker/volumes/nexora_bot_data/_data/bot_data.db");
+  candidates.push("/opt/nexora-bot/data/bot_data.db");
+  candidates.push("/opt/nexora-bot/bot/bot_data.db");
+  return candidates;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getBotDb(readonly = true): any | null {
+  const Sqlite = getSqlite();
+  if (!Sqlite) {
+    console.error("[botdb] sqlite not available:", _sqliteErr);
+    return null;
+  }
+  for (const p of getDbCandidates()) {
+    if (!fs.existsSync(p)) continue;
+    try {
+      return new Sqlite(p, { readonly, fileMustExist: true });
+    } catch (e) {
+      console.error(`[botdb] open failed (${p}):`, String(e));
+    }
+  }
+  console.error("[botdb] no DB found. candidates:", getDbCandidates());
+  return null;
+}
+
+export function getBotDbPath(): string | null {
+  for (const p of getDbCandidates()) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getDbDiagnostics(): Record<string, any> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result: Record<string, any> = {};
+  for (const p of getDbCandidates()) result[p] = fs.existsSync(p);
+  result["__sqlite_loaded"] = _Sqlite !== null;
+  result["__sqlite_error"]  = _sqliteErr ?? "none";
+  return result;
+}
+
+export function requireAuth(req: Request): boolean {
+  const cookie = req.headers.get("cookie") ?? "";
+  if (!cookie.includes("nexora_session=")) return false;
+  const token = cookie.split("nexora_session=")[1]?.split(";")[0]?.trim() ?? "";
+  if (token.length < 20) return false;
+  try {
+    const decoded = Buffer.from(token, "base64").toString("utf8");
+    return decoded.split(":").length >= 3;
+  } catch { return false; }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getSetting(db: any, key: string, def = ""): string {
+  try {
+    const row = db.prepare("SELECT value FROM admin_settings WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value ?? def;
+  } catch { return def; }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function setSetting(db: any, key: string, value: string): void {
+  db.prepare(
+    "INSERT INTO admin_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).run(key, value);
+}
+BOTDBEOF
+}
+
+# ══════════════════════════════════════════════════════════════
 #  Web Panel installer — نسخه Hybrid Stable
 # ══════════════════════════════════════════════════════════════
 _install_webpanel() {
@@ -833,8 +940,17 @@ else:
     _info "Patching lib/xui.ts (v3 — redirect fix + form-encoded fallback)..."
     _patch_xui_ts "$_xui_ts"
     _ok "lib/xui.ts patched ✓"
+
+    # ── patch lib/botdb.ts — dynamic require() به جای static import ──
+    # مشکل: import Database from "better-sqlite3" در module-level — اگه
+    # native addon به هر دلیل (ABI mismatch، npm vs pnpm) load نشه،
+    # کل module crash می‌کنه و DB هرگز خوانده نمی‌شه. با require() فقط
+    # getBotDb null برمی‌گرده و خطا در لاگ journalctl قابل مشاهده است.
+    _info "Patching lib/botdb.ts (dynamic require + error logging)..."
+    _patch_botdb_ts "$_xui_dir/botdb.ts"
+    _ok "lib/botdb.ts patched ✓"
   else
-    _warn "lib/ directory not found — skipping xui.ts patch"
+    _warn "lib/ directory not found — skipping patches"
   fi
 
   # ── 4. Write .env.local BEFORE build ──────────────────────
